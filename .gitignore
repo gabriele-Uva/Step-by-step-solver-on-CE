@@ -1,0 +1,3 @@
+tests/harness
+tests/*.o
+tests/shots/
