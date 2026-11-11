@@ -1,5 +1,5 @@
 /*
- * StepMath CE  (v1)
+ * StepMath CE  (v2)
  * A step-by-step math tutor for the TI-84 Plus CE. The student types a
  * problem; the app recognises its type and shows ONE step of the method at
  * a time, in words, with the running equation or expression.
@@ -20,12 +20,26 @@
  *   5. Fraction arithmetic: two fractions (or a fraction and a whole
  *      number) with + - * /. Write a division of fractions as (1/2)/(3/4).
  *
+ *   6. Square roots typed with sqrt( : an expression such as the quadratic
+ *      formula with the numbers put in, (-5+sqrt(5^2-4*1*6))/(2*1), worked
+ *      out one operation at a time; inside equations sqrt( works on
+ *      perfect squares. sqrt( is typed with 2nd then the x^2 key.
+ *   7. Venn diagrams with 2 or 3 sets: a form for the numbers, the regions
+ *      filled in one per step (and drawn), then a set expression such as
+ *      n(A u B)' n C evaluated (u union, n intersection, ' complement).
+ *
+ * KEYS THAT ARE NOT PLAIN
+ *   2nd lights up (shown on screen) and goes off after the next key; 2nd then
+ *   x^2 types sqrt( . CLEAR erases a character, MODE clears the line.
+ *   DEL quits the program at once from any screen (longjmp to main, which
+ *   calls gfx_End()); nothing is saved.
+ *
  * INPUT GRAMMAR (one line, at most 38 characters)
  *   expr   := term { (+|-) term }
  *   term   := unary { (*|/) unary  |  implicit multiplication }
  *   unary  := - unary | + unary | power
  *   power  := atom [ ^ whole-number ]
- *   atom   := whole number (at most 4 digits) | x | ( expr )
+ *   atom   := whole number (at most 4 digits) | x | ( expr ) | sqrt( expr )
  *   input  := expr [ = expr ]
  *   Implicit multiplication: a number, x or ) followed by x or ( , as in
  *   3x, 2(x+1), x(x-2).  (x+1)(x+2) parses but is refused later: only ONE
@@ -44,6 +58,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <setjmp.h>
 #include <time.h>
 #include <tice.h>
 #include <graphx.h>
@@ -72,10 +87,13 @@
 /* ------------------------------------------------------------------ */
 enum {
     C_TRANSP, C_BG, C_PANEL, C_HEAD, C_WHITE, C_YELLOW, C_GREEN, C_RED, C_CYAN,
-    C_GRAY, C_BLACK, C_DKGRAY, C_ORANGE, C_COUNT
+    C_GRAY, C_BLACK, C_DKGRAY, C_ORANGE,
+    C_VR1, C_VR2, C_VR3, C_VR4, C_VR5, C_VR6, C_VR7,      /* Venn regions by membership mask 1..7 */
+    C_VUNK, C_VHL, C_VHL0, C_BOX, C_COUNT
 };
+#define C_VR(m) ((uint8_t)(C_VR1 + (m) - 1))
 #define RGB(r, g, b) gfx_RGBTo1555(r, g, b)
-static uint16_t pal[16];
+static uint16_t pal[C_COUNT];
 
 static void build_palette(void)
 {
@@ -92,6 +110,17 @@ static void build_palette(void)
     pal[C_BLACK] = RGB(0, 0, 0);
     pal[C_DKGRAY] = RGB(70, 80, 105);
     pal[C_ORANGE] = RGB(255, 160, 60);
+    pal[C_VR1] = RGB(60, 110, 200);      /* A only */
+    pal[C_VR2] = RGB(60, 170, 100);      /* B only */
+    pal[C_VR3] = RGB(60, 160, 170);      /* A and B */
+    pal[C_VR4] = RGB(210, 130, 50);      /* C only */
+    pal[C_VR5] = RGB(135, 120, 125);     /* A and C */
+    pal[C_VR6] = RGB(135, 150, 75);      /* B and C */
+    pal[C_VR7] = RGB(150, 150, 175);     /* A, B and C */
+    pal[C_VUNK] = RGB(44, 54, 84);       /* not filled in yet */
+    pal[C_VHL] = RGB(255, 215, 70);      /* highlighted region */
+    pal[C_VHL0] = RGB(110, 95, 30);      /* highlighted outside region */
+    pal[C_BOX] = RGB(22, 30, 52);        /* inside the universal box, outside the circles */
 }
 
 /* ------------------------------------------------------------------ */
@@ -216,7 +245,7 @@ static void sb_dec2(sb_t *b, long v100)
 /* ------------------------------------------------------------------ */
 /* Parser: text -> syntax tree                                         */
 /* ------------------------------------------------------------------ */
-enum { N_NUM, N_X, N_NEG, N_ADD, N_SUB, N_MUL, N_DIV, N_POW, N_EQ };
+enum { N_NUM, N_X, N_NEG, N_ADD, N_SUB, N_MUL, N_DIV, N_POW, N_EQ, N_SQRT, N_VAL };
 typedef struct { uint8_t t; int16_t l, r; long v; } node_t;
 #define MAXN 120
 static node_t nd[MAXN];
@@ -275,9 +304,21 @@ static int p_atom(void)
         pp++;
         return e;
     }
+    if (pp[0] == 's' && pp[1] == 'q' && pp[2] == 'r' && pp[3] == 't' && pp[4] == '(') {
+        int e;
+        pp += 5;
+        if (++pdepth > 16) { fail_at("Too many brackets inside brackets."); return -1; }
+        e = p_expr();
+        pdepth--;
+        if (e < 0) return -1;
+        skipsp();
+        if (*pp != ')') { fail_at("The closing bracket ) of sqrt( is missing."); return -1; }
+        pp++;
+        return mk(N_SQRT, e, -1, 0);
+    }
     if (*pp == 0) fail_at("The problem ends too early.");
     else if (*pp == ')') fail_at("There is a ) without a ( before it.");
-    else fail_at("I expected a number, x or ( here.");
+    else fail_at("I expected a number, x, ( or sqrt( here.");
     return -1;
 }
 
@@ -329,7 +370,7 @@ static int p_term(void)
             b = p_unary();
             if (b < 0) return -1;
             a = mk(c == '*' ? N_MUL : N_DIV, a, b, 0);
-        } else if (c == 'x' || c == 'X' || c == '(') {
+        } else if (c == 'x' || c == 'X' || c == '(' || c == 's') {
             b = p_pow();                          /* implicit multiplication */
             if (b < 0) return -1;
             a = mk(N_MUL, a, b, 0);
@@ -408,6 +449,76 @@ static bool has_div(int n)
     return has_div(nd[n].l) || has_div(nd[n].r);
 }
 
+static bool has_sqrt(int n)
+{
+    if (n < 0) return false;
+    if (nd[n].t == N_SQRT) return true;
+    if (nd[n].t == N_NUM || nd[n].t == N_X) return false;
+    return has_sqrt(nd[n].l) || has_sqrt(nd[n].r);
+}
+
+/* The whole-number value of an expression made of numbers, + - * ^ and
+   square roots of perfect squares (used for sqrt( inside an equation). */
+#define CILIM 100000000L
+static const char *ci_err;
+static bool ci_eval(int n, long *v)
+{
+    long a, b;
+    const node_t *q;
+    if (n < 0) return false;
+    q = &nd[n];
+    switch (q->t) {
+    case N_NUM:
+        *v = q->v;
+        return true;
+    case N_NEG:
+        if (!ci_eval(q->l, &a)) return false;
+        *v = -a;
+        return true;
+    case N_ADD:
+    case N_SUB:
+    case N_MUL:
+        if (!ci_eval(q->l, &a) || !ci_eval(q->r, &b)) return false;
+        if (q->t == N_ADD) {
+            *v = a + b;
+        } else if (q->t == N_SUB) {
+            *v = a - b;
+        } else {
+            long aa = a < 0 ? -a : a, bb = b < 0 ? -b : b;
+            if (bb != 0 && aa > CILIM / bb) { ci_err = "Those numbers get too big for me."; return false; }
+            *v = a * b;
+        }
+        if (*v > CILIM || *v < -CILIM) { ci_err = "Those numbers get too big for me."; return false; }
+        return true;
+    case N_POW: {
+        long k = nd[q->r].v, r = 1, i;
+        if (!ci_eval(q->l, &a)) return false;
+        for (i = 0; i < k; i++) {
+            long ar = r < 0 ? -r : r, aa = a < 0 ? -a : a;
+            if (aa != 0 && ar > CILIM / aa) { ci_err = "Those numbers get too big for me."; return false; }
+            r *= a;
+        }
+        *v = r;
+        return true;
+    }
+    case N_SQRT: {
+        long s;
+        if (!ci_eval(q->l, &a)) return false;
+        if (a < 0) { ci_err = "There is a square root of a negative number, which has no real value."; return false; }
+        s = isqrtl(a);
+        if (s * s != a) {
+            ci_err = "With x in the problem, sqrt( only works on perfect squares like sqrt(25).";
+            return false;
+        }
+        *v = s;
+        return true;
+    }
+    default:
+        ci_err = "Inside sqrt( here I can only use whole-number sums, products and powers.";
+        return false;
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* Algebra: a side of an equation as a list of terms                   */
 /* ------------------------------------------------------------------ */
@@ -462,6 +573,13 @@ static bool fac(item_t *it, int n)
     case N_NEG:
         it->m.c = -it->m.c;
         return fac(it, q->l);
+    case N_SQRT: {
+        long v;
+        if (has_x(q->l)) { cv_err = "A square root of x is not supported."; return false; }
+        ci_err = 0;
+        if (!ci_eval(n, &v)) { cv_err = ci_err ? ci_err : "I can't use that square root."; return false; }
+        return mul_c(&it->m.c, v);
+    }
     case N_MUL:
         return fac(it, q->l) && fac(it, q->r);
     case N_ADD:
@@ -699,9 +817,10 @@ static void side_sort(side_t *s)
 /* ------------------------------------------------------------------ */
 /* Step storage                                                        */
 /* ------------------------------------------------------------------ */
-enum { PT_NONE, PT_LINEAR, PT_QUAD, PT_SIMPLIFY, PT_DERIV, PT_FRAC };
+enum { PT_NONE, PT_LINEAR, PT_QUAD, PT_SIMPLIFY, PT_DERIV, PT_FRAC, PT_RADICAL, PT_VENN };
 static const char *const PT_NAME[] = {
-    "", "Linear equation", "Quadratic equation", "Simplify expression", "Derivative d/dx", "Fraction arithmetic"
+    "", "Linear equation", "Quadratic equation", "Simplify expression", "Derivative d/dx", "Fraction arithmetic",
+    "Square roots", "Venn diagram"
 };
 
 /* what a step's state line is, so that the tests can check it */
@@ -709,10 +828,11 @@ enum { EQ_NONE, EQ_EQN, EQ_EXPR, EQ_DERIV };
 #define MAXSTEPS 32
 #define STEXT 220
 #define SSTATE 240
-typedef struct { char text[STEXT]; char state[SSTATE]; uint8_t eqv; uint8_t fin; } step_t;
+typedef struct { char text[STEXT]; char state[SSTATE]; uint8_t eqv; uint8_t fin; uint8_t vfill, vhl; } step_t;
 static step_t steps[MAXSTEPS];
 static int nsteps;
 static step_t dummy_step;
+static step_t *st_ptr;          /* the step being written */
 static bool st_over;
 static sb_t tb, sbs;        /* builders for the text and the state of the step being written */
 
@@ -732,6 +852,9 @@ static void st_begin(step_t *s, uint8_t eqv, uint8_t fin)
 {
     s->eqv = eqv;
     s->fin = fin;
+    s->vfill = 0;
+    s->vhl = 0;
+    st_ptr = s;
     sb_init(&tb, s->text, STEXT);
     sb_init(&sbs, s->state, SSTATE);
 }
@@ -1838,6 +1961,1102 @@ static bool solve_frac(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Expressions with square roots (the quadratic formula typed in)      */
+/* ------------------------------------------------------------------ */
+/* Typing sqrt( is what makes this possible: the student can type the
+ * quadratic formula with the numbers put in, for example
+ *     (-5+sqrt(5^2-4*1*6))/(2*1)
+ * and sees it worked out one operation at a time: the numbers under the
+ * root, the root itself (perfect square / simplified / left as it is), the
+ * sums and the division, then the answer with a decimal estimate.
+ * A value is (u + w*sqrt(m)) / den in lowest terms (den > 0; w = 0 for a
+ * plain number or fraction). Only ONE kind of root can be mixed in one
+ * expression, and a root can only be taken of a whole number. Every
+ * finished operation turns its node into an N_VAL node. */
+#define VLIM 1000000000L
+#define MAXRV 64
+static root_t rvals[MAXRV];
+static int nrv, rd_root;
+static const char *rd_err;
+
+static bool vmul(long a, long b, long *r)
+{
+    long aa = a < 0 ? -a : a, bb = b < 0 ? -b : b;
+    if (aa != 0 && bb > VLIM / aa) return false;
+    *r = a * b;
+    return true;
+}
+
+static bool vok(long v)
+{
+    return v <= VLIM && v >= -VLIM;
+}
+
+static void rv_norm(root_t *r)
+{
+    long g;
+    if (r->den < 0) { r->u = -r->u; r->w = -r->w; r->den = -r->den; }
+    if (r->w == 0) r->m = 1;
+    g = gcdl(gcdl(r->u, r->w), r->den);
+    if (g > 1) { r->u /= g; r->w /= g; r->den /= g; }
+}
+
+static void rv_int(root_t *r, long n)
+{
+    r->u = n;
+    r->w = 0;
+    r->m = 1;
+    r->den = 1;
+}
+
+#define RV_BIG (rd_err = "The numbers get too big for me.", false)
+
+/* a + sg * b */
+static bool rv_add(root_t *r, const root_t *a, const root_t *b, int sg)
+{
+    long l, fa, fb, t1, t2, t3, t4, m;
+    if (a->w != 0 && b->w != 0 && a->m != b->m) {
+        rd_err = "I can only combine square roots of the same number.";
+        return false;
+    }
+    m = a->w != 0 ? a->m : b->m;
+    l = a->den / gcdl(a->den, b->den);
+    if (!vmul(l, b->den, &l)) return RV_BIG;
+    fa = l / a->den;
+    fb = l / b->den;
+    if (!vmul(a->u, fa, &t1) || !vmul(b->u, fb, &t2) || !vmul(a->w, fa, &t3) || !vmul(b->w, fb, &t4)) return RV_BIG;
+    r->u = t1 + sg * t2;
+    r->w = t3 + sg * t4;
+    r->m = m;
+    r->den = l;
+    if (!vok(r->u) || !vok(r->w)) return RV_BIG;
+    rv_norm(r);
+    return true;
+}
+
+static bool rv_mul(root_t *r, const root_t *a, const root_t *b)
+{
+    long t1, t2, t3, t4, t5, m;
+    if (a->w != 0 && b->w != 0 && a->m != b->m) {
+        rd_err = "I can only combine square roots of the same number.";
+        return false;
+    }
+    m = a->w != 0 ? a->m : (b->w != 0 ? b->m : 1);
+    if (!vmul(a->u, b->u, &t1) || !vmul(a->w, b->w, &t2) || !vmul(t2, m, &t2)) return RV_BIG;
+    if (!vmul(a->u, b->w, &t3) || !vmul(a->w, b->u, &t4) || !vmul(a->den, b->den, &t5)) return RV_BIG;
+    r->u = t1 + t2;
+    r->w = t3 + t4;
+    r->m = m;
+    r->den = t5;
+    if (!vok(r->u) || !vok(r->w)) return RV_BIG;
+    rv_norm(r);
+    return true;
+}
+
+static bool rv_div(root_t *r, const root_t *a, const root_t *b)
+{
+    root_t inv;
+    if (b->u == 0 && b->w == 0) {
+        rd_err = "Dividing by 0 is undefined.";
+        return false;
+    }
+    if (b->w == 0) {
+        inv.u = b->den;
+        inv.w = 0;
+        inv.m = 1;
+        inv.den = b->u;
+    } else {
+        /* 1/b = den (u - w sqrt(m)) / (u^2 - w^2 m) */
+        long uu, ww;
+        if (!vmul(b->u, b->u, &uu) || !vmul(b->w, b->w, &ww) || !vmul(ww, b->m, &ww)) return RV_BIG;
+        if (!vmul(b->den, b->u, &inv.u) || !vmul(b->den, b->w, &inv.w)) return RV_BIG;
+        inv.w = -inv.w;
+        inv.m = b->m;
+        inv.den = uu - ww;
+    }
+    rv_norm(&inv);
+    return rv_mul(r, a, &inv);
+}
+
+/* n = f*f*m with m as small as possible (n > 0) */
+static void rad_split(long n, long *f, long *m)
+{
+    long k;
+    *f = 1;
+    *m = n;
+    for (k = 2; k * k <= *m; k++) {
+        while (*m % (k * k) == 0) {
+            *m /= k * k;
+            *f *= k;
+        }
+    }
+}
+
+/* the value times 100, rounded; false if it is too big to estimate */
+static bool rv_v100(const root_t *r, long *out)
+{
+    long numer, s, t;
+    if (r->w == 0) {
+        if (!vmul(r->u, 100, &numer)) return false;
+        *out = round_div(numer, r->den);
+        return true;
+    }
+    if (r->m > 500000000L) return false;
+    s = sqrt_scaled(r->m, 3);
+    if (!vmul(r->w, s, &t) || !vmul(r->u, 1000, &numer)) return false;
+    numer += t;
+    *out = round_div(round_div(numer, r->den), 10);
+    return true;
+}
+
+/* a value as text: 5, -3/4, sqrt(17), (-3 + sqrt(17))/4 */
+static void sb_rv(sb_t *b, const root_t *r)
+{
+    if (r->w == 0) sb_frac(b, r->u, r->den);
+    else sb_surd(b, r);
+}
+
+static void sb_rv_approx(sb_t *b, const root_t *r)
+{
+    long v;
+    if ((r->w != 0 || r->den != 1) && rv_v100(r, &v)) {
+        sb_s(b, "   (about ");
+        sb_dec2(b, v);
+        sb_c(b, ')');
+    }
+}
+
+/* the tree as text; ctx: 0 plain, 1 right of + or -, 2 left of * or /, 3 base of ^ or under a -, 4 right of * or / */
+static void sb_ast(sb_t *b, int n, int ctx)
+{
+    const node_t *q = &nd[n];
+    bool br;
+    switch (q->t) {
+    case N_NUM:
+        sb_n(b, q->v);
+        break;
+    case N_VAL: {
+        const root_t *r = &rvals[q->v];
+        bool neg = r->w == 0 ? r->u < 0 : (r->u < 0 || (r->u == 0 && r->w < 0));
+        bool frac = r->den != 1;
+        bool sum = r->w != 0 && r->u != 0 && r->den == 1;
+        bool coef = r->w != 0 && (r->w != 1 || r->u != 0);
+        br = ctx == 1 ? neg : (ctx == 2 || ctx == 4) ? (neg || sum || frac) : ctx == 3 ? (neg || sum || frac || coef) : false;
+        if (br) sb_c(b, '(');
+        sb_rv(b, r);
+        if (br) sb_c(b, ')');
+        break;
+    }
+    case N_NEG:
+        br = ctx != 0;
+        if (br) sb_c(b, '(');
+        sb_c(b, '-');
+        sb_ast(b, q->l, 3);
+        if (br) sb_c(b, ')');
+        break;
+    case N_SQRT:
+        sb_s(b, "sqrt(");
+        sb_ast(b, q->l, 0);
+        sb_c(b, ')');
+        break;
+    case N_POW:
+        sb_ast(b, q->l, 3);
+        sb_c(b, '^');
+        sb_ast(b, q->r, 0);
+        break;
+    case N_ADD:
+    case N_SUB:
+        br = ctx != 0;
+        if (br) sb_c(b, '(');
+        sb_ast(b, q->l, 0);
+        sb_op(b, q->t == N_SUB);
+        sb_ast(b, q->r, 1);
+        if (br) sb_c(b, ')');
+        break;
+    default:                      /* N_MUL, N_DIV */
+        br = ctx >= 3;
+        if (br) sb_c(b, '(');
+        sb_ast(b, q->l, 2);
+        sb_sym(b, q->t == N_MUL ? '*' : '/');
+        sb_ast(b, q->r, 4);
+        if (br) sb_c(b, ')');
+        break;
+    }
+}
+
+static void rd_leaf(int n, root_t *v)
+{
+    if (nd[n].t == N_VAL) *v = rvals[nd[n].v];
+    else rv_int(v, nd[n].v);
+}
+
+/* the first operation (left to right, innermost first) whose operands are
+   plain values, or -1 when the whole expression is one value */
+static int rd_find(int n)
+{
+    const node_t *q = &nd[n];
+    int r;
+    if (q->t == N_NUM || q->t == N_VAL) return -1;
+    r = rd_find(q->l);
+    if (r >= 0) return r;
+    if (q->t != N_NEG && q->t != N_SQRT) {
+        r = rd_find(q->r);
+        if (r >= 0) return r;
+    }
+    return n;
+}
+
+static bool rd_set(int n, const root_t *v)
+{
+    if (nrv >= MAXRV) { rd_err = "That expression is too long for me."; return false; }
+    rvals[nrv] = *v;
+    nd[n].t = N_VAL;
+    nd[n].v = nrv++;
+    nd[n].l = nd[n].r = -1;
+    return true;
+}
+
+/* the same text apart from spaces */
+static bool same_text(const char *a, const char *b)
+{
+    for (;;) {
+        while (*a == ' ' || *a == NB) a++;
+        while (*b == ' ' || *b == NB) b++;
+        if (*a != *b) return false;
+        if (*a == 0) return true;
+        a++;
+        b++;
+    }
+}
+
+/* one operation: write its step (or fold it without a step when nothing visible changes) */
+static bool rd_step(int n)
+{
+    node_t *q = &nd[n];
+    root_t a, b, r;
+    char before[96], after[96];
+    sb_t sb1, sb2;
+    const char *verb = "";
+    int t = q->t;
+    long f = 1, m = 1;
+    bool root_step = false;
+    sb_init(&sb1, before, sizeof before);
+    sb_ast(&sb1, n, 0);
+    rd_leaf(q->l, &a);
+    if (t == N_SQRT) {
+        long s;
+        if (a.w != 0 || a.den != 1) { rd_err = "I can only take the square root of a whole number."; return false; }
+        if (a.u < 0) { rd_err = "The number under a square root is negative, so there is no real square root."; return false; }
+        s = isqrtl(a.u);
+        root_step = true;
+        if (s * s == a.u) {
+            rv_int(&r, s);
+        } else {
+            rad_split(a.u, &f, &m);
+            r.u = 0;
+            r.w = f;
+            r.m = m;
+            r.den = 1;
+        }
+        verb = "Square root: ";
+    } else {
+        bool ok = false;
+        rd_leaf(q->r, &b);
+        switch (t) {
+        case N_ADD: ok = rv_add(&r, &a, &b, 1); verb = "Add: "; break;
+        case N_SUB: ok = rv_add(&r, &a, &b, -1); verb = "Subtract: "; break;
+        case N_MUL: ok = rv_mul(&r, &a, &b); verb = "Multiply: "; break;
+        case N_DIV: ok = rv_div(&r, &a, &b); verb = "Divide: "; break;
+        default: {                            /* N_POW */
+            long k = nd[q->r].v, i;
+            rv_int(&r, 1);
+            ok = true;
+            for (i = 0; i < k && ok; i++) {
+                root_t t2 = r;
+                ok = rv_mul(&r, &t2, &a);
+            }
+            verb = "Power: ";
+            break;
+        }
+        }
+        if (!ok) return false;
+    }
+    sb_init(&sb2, after, sizeof after);
+    sb_rv(&sb2, &r);
+    if (!root_step) {
+        /* the finished operation as it would be written: compare ignoring spaces */
+        char shown[96];
+        sb_t sb3;
+        root_t keep = r;
+        sb_init(&sb3, shown, sizeof shown);
+        sb_rv(&sb3, &keep);
+        if (same_text(before, shown)) {
+            return rd_set(n, &r);                       /* nothing visible happens: no step */
+        }
+        /* a plain number and a root cannot be combined: it just stays as it is */
+        if ((t == N_ADD || t == N_SUB) && (a.w == 0) != (b.w == 0) && (a.w == 0 ? a.u != 0 : b.u != 0) && keep.w != 0) {
+            return rd_set(n, &r);
+        }
+    }
+    if (!rd_set(n, &r)) return false;
+    st_new(EQ_EXPR);
+    sb_s(&tb, verb);
+    if (root_step) {
+        if (r.w == 0) {
+            sb_s(&tb, before);
+            sb_s(&tb, " = ");
+            sb_s(&tb, after);
+            sb_s(&tb, ", because ");
+            sb_n(&tb, r.u);
+            sb_s(&tb, " * ");
+            sb_n(&tb, r.u);
+            sb_s(&tb, " = ");
+            sb_n(&tb, a.u);
+            sb_c(&tb, '.');
+        } else if (f > 1) {
+            sb_s(&tb, before);
+            sb_s(&tb, " = ");
+            sb_s(&tb, after);
+            sb_s(&tb, ". Pull out the square factor: ");
+            sb_n(&tb, a.u);
+            sb_s(&tb, " = ");
+            sb_n(&tb, f * f);
+            sb_s(&tb, " * ");
+            sb_n(&tb, m);
+            sb_c(&tb, '.');
+        } else {
+            sb_s(&tb, before);
+            sb_s(&tb, " is not a perfect square and has no square factor, so it stays as it is");
+            if (rv_v100(&r, &f)) {
+                sb_s(&tb, " (about ");
+                sb_dec2(&tb, f);
+                sb_c(&tb, ')');
+            }
+            sb_c(&tb, '.');
+        }
+    } else {
+        sb_s(&tb, before);
+        sb_s(&tb, " = ");
+        sb_s(&tb, after);
+        sb_c(&tb, '.');
+    }
+    sb_ast(&sbs, rd_root, 0);
+    return true;
+}
+
+static bool solve_radical(int root)
+{
+    int guard = 0;
+    root_t v;
+    steps_reset();
+    res.type = PT_RADICAL;
+    nrv = 0;
+    rd_err = 0;
+    rd_root = root;
+    if (has_x(root)) { g_fail = "A square root of x is not supported. Put numbers under sqrt(."; return false; }
+    for (;;) {
+        int n = rd_find(root);
+        if (n < 0) break;
+        if (nd[n].t == N_NEG) {                     /* a minus sign in front of a value: no step */
+            rd_leaf(nd[n].l, &v);
+            v.u = -v.u;
+            v.w = -v.w;
+            rv_norm(&v);
+            if (!rd_set(n, &v)) { g_fail = rd_err; return false; }
+            continue;
+        }
+        if (++guard > 80) { g_fail = "That expression is too long for me."; return false; }
+        if (!rd_step(n)) { g_fail = rd_err; return false; }
+    }
+    if (st_over) { g_fail = "That expression needs too many steps for me."; return false; }
+    rd_leaf(root, &v);
+    st_final(EQ_NONE);
+    sb_s(&tb, "Final answer: ");
+    sb_rv(&tb, &v);
+    sb_s(&sbs, "= ");
+    sb_rv(&sbs, &v);
+    sb_rv_approx(&sbs, &v);
+    res.kind = RK_ROOTS;
+    res.nroots = 1;
+    res.root[0] = v;
+    res.root[1] = v;
+    return true;
+}
+
+/* ------------------------------------------------------------------ */
+/* Venn diagrams (2 and 3 sets)                                        */
+/* ------------------------------------------------------------------ */
+/* The numbers come from a form, the way they are on a worksheet:
+ *   2 sets   n(U)  n(A)  n(B)  n(A n B)             [outside, optional]
+ *   3 sets   n(U)  n(A)  n(B)  n(C)  n(A n B)  n(A n C)  n(B n C)
+ *            n(A n B n C)                            [outside, optional]
+ * where n(A n B) is EVERYTHING in both A and B (the middle included).
+ * A region is named by its membership mask: bit 0 = in A, bit 1 = in B,
+ * bit 2 = in C, so 0 is outside all the sets and 7 the middle.
+ * The regions are filled in one per step, innermost first:
+ *   middle  ->  the pairwise-only regions (subtract the middle)
+ *           ->  the only-A / only-B / only-C regions (subtract the rest)
+ *           ->  outside (n(U) minus everything inside the circles)
+ * A region that would be negative, or an outside count that does not match,
+ * stops with a plain message: the numbers do not fit together.
+ * Then the typed expression is worked out, in set notation with
+ *   A B C  the sets      u  union      n  intersection      '  complement
+ *   n( ... ) = brackets that also say "count this", so n(A u B)' n C means
+ *   (A u B)' n C.  ' binds first, then n, then u.                       */
+#define VMAX 999
+enum { VF_U, VF_A, VF_B, VF_C, VF_AB, VF_AC, VF_BC, VF_ABC, VF_NONE, VF_N };
+static uint8_t vn_k = 2;
+static long vn_f[VF_N];            /* the numbers; -1 = left blank */
+static char vn_expr[MAXIN + 1];    /* the expression to evaluate, may be empty */
+static long vr[8];                 /* region counts by membership mask */
+static char vn_msg[200];           /* why the numbers do not fit, or the expression error */
+static const char *vn_head;        /* the heading that goes with it */
+static int vn_at;                  /* position of an expression error, or -1 */
+static uint8_t vfilled;            /* regions shown so far (bit = mask) */
+
+/* a step that fills region `reg` (or none: reg < 0) and highlights `hl` */
+static void vstep(int reg, uint8_t hl)
+{
+    st_new(EQ_NONE);
+    if (reg >= 0) vfilled = (uint8_t)(vfilled | (1 << reg));
+    st_ptr->vfill = vfilled;
+    st_ptr->vhl = hl;
+}
+
+static bool vn_bad(const char *head)
+{
+    vn_head = head;
+    vn_at = -1;
+    return false;
+}
+
+static const char *const VF_LABEL[VF_N] = {
+    "n(U)", "n(A)", "n(B)", "n(C)", "n(A n B)", "n(A n C)", "n(B n C)", "n(A n B n C)", "outside"
+};
+
+/* fills vr[] step by step; false with vn_head / vn_msg set when the numbers do not fit */
+static bool venn_fill(void)
+{
+    long U = vn_f[VF_U], A = vn_f[VF_A], B = vn_f[VF_B], C = vn_f[VF_C];
+    long AB = vn_f[VF_AB], AC = vn_f[VF_AC], BC = vn_f[VF_BC], ABC = vn_f[VF_ABC], none = vn_f[VF_NONE];
+    long inside;
+    sb_t vb;
+    int i;
+    static const uint8_t need2[] = { VF_U, VF_A, VF_B, VF_AB };
+    static const uint8_t need3[] = { VF_U, VF_A, VF_B, VF_C, VF_AB, VF_AC, VF_BC, VF_ABC };
+    const uint8_t *need = vn_k == 2 ? need2 : need3;
+    int nneed = vn_k == 2 ? 4 : 8;
+    memset(vr, 0, sizeof vr);
+    vfilled = 0;
+    sb_init(&vb, vn_msg, sizeof vn_msg);
+    for (i = 0; i < nneed; i++) {
+        if (vn_f[need[i]] < 0 || vn_f[need[i]] > VMAX) {
+            sb_s(&vb, "Please fill in ");
+            sb_s(&vb, VF_LABEL[need[i]]);
+            sb_s(&vb, " with a whole number from 0 to 999.");
+            return vn_bad("A number is missing.");
+        }
+    }
+    if (none > VMAX) {
+        sb_s(&vb, "The outside count must be a whole number from 0 to 999 (or empty).");
+        return vn_bad("A number is missing.");
+    }
+
+    if (vn_k == 2) {
+        vr[3] = AB;
+        vstep(3, 1 << 3);
+        sb_s(&tb, "Start with the overlap. n(A n B) = ");
+        sb_n(&tb, AB);
+        sb_s(&tb, " is the part that is in both A and B.");
+        sb_s(&sbs, "A and B = ");
+        sb_n(&sbs, AB);
+
+        vr[1] = A - AB;
+        if (vr[1] < 0) {
+            sb_s(&vb, "Only A would be ");
+            sb_n(&vb, A);
+            sb_s(&vb, " - ");
+            sb_n(&vb, AB);
+            sb_s(&vb, ", which is below zero. The overlap n(A n B) cannot be bigger than the whole set n(A).");
+            return vn_bad("The numbers don't fit together.");
+        }
+        vstep(1, 1 << 1);
+        sb_s(&tb, "Only A: take the overlap away from all of A. n(A) - n(A n B).");
+        sb_n(&sbs, A);
+        sb_s(&sbs, " - ");
+        sb_n(&sbs, AB);
+        sb_s(&sbs, " = ");
+        sb_n(&sbs, vr[1]);
+
+        vr[2] = B - AB;
+        if (vr[2] < 0) {
+            sb_s(&vb, "Only B would be ");
+            sb_n(&vb, B);
+            sb_s(&vb, " - ");
+            sb_n(&vb, AB);
+            sb_s(&vb, ", which is below zero. The overlap n(A n B) cannot be bigger than the whole set n(B).");
+            return vn_bad("The numbers don't fit together.");
+        }
+        vstep(2, 1 << 2);
+        sb_s(&tb, "Only B: take the overlap away from all of B. n(B) - n(A n B).");
+        sb_n(&sbs, B);
+        sb_s(&sbs, " - ");
+        sb_n(&sbs, AB);
+        sb_s(&sbs, " = ");
+        sb_n(&sbs, vr[2]);
+
+        inside = vr[1] + vr[2] + vr[3];
+    } else {
+        long ab, ac, bc;
+        vr[7] = ABC;
+        vstep(7, 1 << 7);
+        sb_s(&tb, "Start in the middle: the part in all three sets is n(A n B n C) = ");
+        sb_n(&tb, ABC);
+        sb_c(&tb, '.');
+        sb_s(&sbs, "A, B and C = ");
+        sb_n(&sbs, ABC);
+
+        ab = AB - ABC;
+        ac = AC - ABC;
+        bc = BC - ABC;
+        {
+            static const char *const nm[3] = { "A and B", "A and C", "B and C" };
+            long pair[3], mid[3];
+            uint8_t mask[3] = { 3, 5, 6 };
+            int p;
+            pair[0] = AB; pair[1] = AC; pair[2] = BC;
+            mid[0] = ab; mid[1] = ac; mid[2] = bc;
+            for (p = 0; p < 3; p++) {
+                if (mid[p] < 0) {
+                    sb_s(&vb, nm[p]);
+                    sb_s(&vb, " only would be ");
+                    sb_n(&vb, pair[p]);
+                    sb_s(&vb, " - ");
+                    sb_n(&vb, ABC);
+                    sb_s(&vb, ", which is below zero. The overlap of two sets must hold the middle (all three) too.");
+                    return vn_bad("The numbers don't fit together.");
+                }
+                vr[mask[p]] = mid[p];
+                vstep(mask[p], (uint8_t)(1 << mask[p]));
+                sb_s(&tb, nm[p]);
+                sb_s(&tb, " only: take the middle away from the overlap. n(");
+                sb_s(&tb, p == 0 ? "A n B" : p == 1 ? "A n C" : "B n C");
+                sb_s(&tb, ") - n(A n B n C).");
+                sb_n(&sbs, pair[p]);
+                sb_s(&sbs, " - ");
+                sb_n(&sbs, ABC);
+                sb_s(&sbs, " = ");
+                sb_n(&sbs, mid[p]);
+            }
+        }
+        {
+            static const char *const nm[3] = { "A", "B", "C" };
+            long tot[3], low[3][2], sp;
+            uint8_t mask[3] = { 1, 2, 4 };
+            int p;
+            tot[0] = A; tot[1] = B; tot[2] = C;
+            low[0][0] = ab; low[0][1] = ac;
+            low[1][0] = ab; low[1][1] = bc;
+            low[2][0] = ac; low[2][1] = bc;
+            for (p = 0; p < 3; p++) {
+                sp = tot[p] - low[p][0] - low[p][1] - ABC;
+                if (sp < 0) {
+                    sb_s(&vb, "Only ");
+                    sb_s(&vb, nm[p]);
+                    sb_s(&vb, " would be ");
+                    sb_n(&vb, tot[p]);
+                    sb_s(&vb, " - ");
+                    sb_n(&vb, low[p][0]);
+                    sb_s(&vb, " - ");
+                    sb_n(&vb, low[p][1]);
+                    sb_s(&vb, " - ");
+                    sb_n(&vb, ABC);
+                    sb_s(&vb, ", which is below zero. n(");
+                    sb_s(&vb, nm[p]);
+                    sb_s(&vb, ") is too small to hold its overlaps.");
+                    return vn_bad("The numbers don't fit together.");
+                }
+                vr[mask[p]] = sp;
+                vstep(mask[p], (uint8_t)(1 << mask[p]));
+                sb_s(&tb, nm[p]);
+                sb_s(&tb, " only: take away the two pair-only parts and the middle from all of ");
+                sb_s(&tb, nm[p]);
+                sb_c(&tb, '.');
+                sb_n(&sbs, tot[p]);
+                sb_s(&sbs, " - ");
+                sb_n(&sbs, low[p][0]);
+                sb_s(&sbs, " - ");
+                sb_n(&sbs, low[p][1]);
+                sb_s(&sbs, " - ");
+                sb_n(&sbs, ABC);
+                sb_s(&sbs, " = ");
+                sb_n(&sbs, sp);
+            }
+        }
+        inside = vr[1] + vr[2] + vr[3] + vr[4] + vr[5] + vr[6] + vr[7];
+    }
+
+    vr[0] = U - inside;
+    if (vr[0] < 0) {
+        sb_s(&vb, "The circles already hold ");
+        sb_n(&vb, inside);
+        sb_s(&vb, " elements, but n(U) is only ");
+        sb_n(&vb, U);
+        sb_s(&vb, ". n(U) must be at least ");
+        sb_n(&vb, inside);
+        sb_c(&vb, '.');
+        return vn_bad("The numbers don't fit together.");
+    }
+    if (none >= 0 && none != vr[0]) {
+        sb_s(&vb, "The circles hold ");
+        sb_n(&vb, inside);
+        sb_s(&vb, " elements, so ");
+        sb_n(&vb, U);
+        sb_s(&vb, " - ");
+        sb_n(&vb, inside);
+        sb_s(&vb, " = ");
+        sb_n(&vb, vr[0]);
+        sb_s(&vb, " are outside, but the problem says ");
+        sb_n(&vb, none);
+        sb_s(&vb, ". The numbers do not add up to n(U) = ");
+        sb_n(&vb, U);
+        sb_c(&vb, '.');
+        return vn_bad("The numbers don't fit together.");
+    }
+    vstep(0, 1);
+    sb_s(&tb, "Outside all the circles: n(U) minus everything inside them (");
+    {
+        int m, first = 1;
+        for (m = 1; m < (1 << vn_k); m++) {
+            if (!first) sb_op(&tb, false);
+            sb_n(&tb, vr[m]);
+            first = 0;
+        }
+    }
+    sb_s(&tb, " = ");
+    sb_n(&tb, inside);
+    sb_s(&tb, ").");
+    sb_n(&sbs, U);
+    sb_s(&sbs, " - ");
+    sb_n(&sbs, inside);
+    sb_s(&sbs, " = ");
+    sb_n(&sbs, vr[0]);
+    return true;
+}
+
+/* the calculation panel of the Venn screen is this many columns wide and 10 lines high */
+#define VCOLS 13
+static int wrap_draw(const char *s, int x, int y, int cols, int maxl, uint8_t color, bool draw);
+
+/* the calculation line "prefix = sym = num"; the prefix, then the symbolic part, are dropped until it fits the panel */
+static void vcalc(const char *prefix, const char *sym, const char *num)
+{
+    char buf[SSTATE];
+    sb_t b;
+    int tries;
+    for (tries = 0; tries < 3; tries++) {
+        sb_init(&b, buf, sizeof buf);
+        if (tries < 1 && prefix[0]) { sb_s(&b, prefix); sb_s(&b, " = "); }
+        if (tries < 2 && sym[0]) { sb_s(&b, sym); sb_s(&b, " = "); }
+        sb_s(&b, num);
+        if (wrap_draw(buf, 0, 0, VCOLS, 100, 0, false) <= 10) break;
+    }
+    sb_s(&sbs, buf);
+}
+
+/* add a sentence to the text of the step only if the text then still fits in 3 lines */
+static void vtail(const char *tail)
+{
+    char buf[STEXT];
+    sb_t b;
+    sb_init(&b, buf, sizeof buf);
+    sb_s(&b, tb.p);
+    sb_s(&b, tail);
+    if (wrap_draw(buf, 0, 0, COLS, 100, 0, false) <= 3) sb_s(&tb, tail);
+}
+
+/* ---- set expressions ---- */
+enum { SN_SET, SN_NOT, SN_OR, SN_AND };
+typedef struct { uint8_t t, v; int8_t l, r; } sn_t;
+#define MAXSN 40
+static sn_t sn[MAXSN];
+static int nsn, sn_root;
+static const char *se_p, *se_in, *se_err;
+static int se_at;
+static uint8_t se_depth;
+
+static void se_fail(const char *m)
+{
+    if (!se_err) { se_err = m; se_at = (int)(se_p - se_in); }
+}
+
+static int se_mk(uint8_t t, int l, int r, uint8_t v)
+{
+    if (nsn >= MAXSN) { se_fail("That expression is too long for me."); return -1; }
+    sn[nsn].t = t;
+    sn[nsn].l = (int8_t)l;
+    sn[nsn].r = (int8_t)r;
+    sn[nsn].v = v;
+    return nsn++;
+}
+
+static int se_expr(void);
+
+static int se_atom(void)
+{
+    char c = *se_p;
+    int e;
+    if (c == 'A' || c == 'B' || c == 'C') {
+        if (c - 'A' >= vn_k) { se_fail("This is a 2-set problem, so there is no set C."); return -1; }
+        se_p++;
+        return se_mk(SN_SET, -1, -1, (uint8_t)(c - 'A'));
+    }
+    if (c == '(' || (c == 'n' && se_p[1] == '(')) {
+        /* n( at the start of an operand is just a bracket that says "count this" */
+        se_p += c == 'n' ? 2 : 1;
+        if (++se_depth > 8) { se_fail("Too many brackets inside brackets."); return -1; }
+        e = se_expr();
+        se_depth--;
+        if (e < 0) return -1;
+        if (*se_p != ')') { se_fail("A closing bracket ) is missing."); return -1; }
+        se_p++;
+        return e;
+    }
+    if (c == 0) se_fail("The expression ends too early.");
+    else if (c == ')') se_fail("There is a ) without a ( before it.");
+    else se_fail("I expected A, B, C, ( or n( here.");
+    return -1;
+}
+
+static int se_fact(void)
+{
+    int a = se_atom();
+    while (a >= 0 && *se_p == '\'') {
+        se_p++;
+        a = se_mk(SN_NOT, a, -1, 0);
+    }
+    return a;
+}
+
+static int se_term(void)
+{
+    int a = se_fact(), b;
+    while (a >= 0 && *se_p == 'n') {
+        se_p++;
+        b = se_fact();
+        if (b < 0) return -1;
+        a = se_mk(SN_AND, a, b, 0);
+    }
+    return a;
+}
+
+static int se_expr(void)
+{
+    int a = se_term(), b;
+    while (a >= 0 && *se_p == 'u') {
+        se_p++;
+        b = se_term();
+        if (b < 0) return -1;
+        a = se_mk(SN_OR, a, b, 0);
+    }
+    return a;
+}
+
+/* the root node, or -1 with se_err / se_at set */
+static int se_parse(const char *s)
+{
+    int a;
+    nsn = 0;
+    se_err = 0;
+    se_at = 0;
+    se_depth = 0;
+    se_in = se_p = s;
+    a = se_expr();
+    if (a < 0) return -1;
+    if (*se_p != 0) {
+        se_fail(*se_p == ')' ? "There is a ) without a ( before it." : "I do not understand this part.");
+        return -1;
+    }
+    return a;
+}
+
+/* ctx: 0 top, 1 under u, 2 under n, 3 under ' */
+static void sb_sn(sb_t *b, int i, int ctx)
+{
+    const sn_t *q = &sn[i];
+    bool br;
+    switch (q->t) {
+    case SN_SET:
+        sb_c(b, (char)('A' + q->v));
+        break;
+    case SN_NOT:
+        sb_sn(b, q->l, 3);
+        sb_c(b, '\'');
+        break;
+    case SN_AND:
+        br = ctx == 3;
+        if (br) sb_c(b, '(');
+        sb_sn(b, q->l, 2);
+        sb_sym(b, 'n');
+        sb_sn(b, q->r, 2);
+        if (br) sb_c(b, ')');
+        break;
+    default:
+        br = ctx >= 2;
+        if (br) sb_c(b, '(');
+        sb_sn(b, q->l, 1);
+        sb_sym(b, 'u');
+        sb_sn(b, q->r, 1);
+        if (br) sb_c(b, ')');
+        break;
+    }
+}
+
+/* the set of regions (bit = membership mask) that node i covers */
+static uint8_t se_eval(int i)
+{
+    const sn_t *q = &sn[i];
+    uint8_t full = (uint8_t)(vn_k == 2 ? 0x0F : 0xFF), r = 0;
+    int m;
+    switch (q->t) {
+    case SN_SET:
+        for (m = 0; m < (1 << vn_k); m++) if ((m >> q->v) & 1) r = (uint8_t)(r | (1 << m));
+        return r;
+    case SN_NOT:
+        return (uint8_t)(~se_eval(q->l) & full);
+    case SN_OR:
+        return (uint8_t)(se_eval(q->l) | se_eval(q->r));
+    default:
+        return (uint8_t)(se_eval(q->l) & se_eval(q->r));
+    }
+}
+
+static long se_count(uint8_t set)
+{
+    long t = 0;
+    int m;
+    for (m = 0; m < (1 << vn_k); m++) if (set & (1 << m)) t += vr[m];
+    return t;
+}
+
+/* "7 + 5 + 4 = 16" for the regions of a set (the outside region last) */
+static void sb_regsum(sb_t *b, uint8_t set)
+{
+    int m, n = 0;
+    for (m = 1; m <= (1 << vn_k); m++) {
+        int r = m == (1 << vn_k) ? 0 : m;
+        if (!(set & (1 << r))) continue;
+        if (n++) sb_op(b, false);
+        sb_n(b, vr[r]);
+    }
+    if (n == 0) sb_c(b, '0');
+    else if (n > 1) {
+        sb_s(b, " = ");
+        sb_n(b, se_count(set));
+    }
+}
+
+/* total of one set, and of the overlap of two sets, as typed */
+static long vn_set_total(int v) { return vn_f[v == 0 ? VF_A : v == 1 ? VF_B : VF_C]; }
+static long vn_pair_total(int x, int y)
+{
+    if (x > y) { int t = x; x = y; y = t; }
+    return vn_f[x == 0 && y == 1 ? VF_AB : x == 0 ? VF_AC : VF_BC];
+}
+
+/* which sets appear in a tree of unions only (a bit for each set), or 0 if there is anything else */
+static uint8_t se_union_sets(int i)
+{
+    const sn_t *q = &sn[i];
+    uint8_t a, b;
+    if (q->t == SN_SET) return (uint8_t)(1 << q->v);
+    if (q->t != SN_OR) return 0;
+    a = se_union_sets(q->l);
+    b = se_union_sets(q->r);
+    if (!a || !b || (a & b)) return 0;
+    return (uint8_t)(a | b);
+}
+
+/* the compound nodes under the root, innermost first */
+static int se_ord[10], se_nord;
+static bool se_collect(int i, int root)
+{
+    const sn_t *q = &sn[i];
+    if (q->t == SN_SET) return true;
+    if (!se_collect(q->l, root)) return false;
+    if (q->t != SN_NOT && !se_collect(q->r, root)) return false;
+    if (i != root) {
+        if (se_nord >= 8) return false;
+        se_ord[se_nord++] = i;
+    }
+    return true;
+}
+
+static bool venn_expr(void)
+{
+    int i;
+    uint8_t set, usets;
+    long total;
+    sb_t vb;
+    char pre[100], sym[170], num[110];
+    sb_t bp, bs, bn;
+    sb_init(&vb, vn_msg, sizeof vn_msg);
+    sn_root = se_parse(vn_expr);
+    if (sn_root < 0) {
+        sb_s(&vb, se_err);
+        vn_head = "I can't read that expression.";
+        vn_at = se_at;
+        return false;
+    }
+    se_nord = 0;
+    if (!se_collect(sn_root, sn_root)) {
+        sb_s(&vb, "That expression has too many parts for me. Try a shorter one.");
+        return vn_bad("I can't read that expression.");
+    }
+    for (i = 0; i < se_nord; i++) {
+        const sn_t *q = &sn[se_ord[i]];
+        set = se_eval(se_ord[i]);
+        vfilled = (uint8_t)(vn_k == 2 ? 0x0F : 0xFF);
+        st_new(EQ_NONE);
+        st_ptr->vfill = vfilled;
+        st_ptr->vhl = set;
+        sb_s(&tb, "Work out ");
+        sb_sn(&tb, se_ord[i], 0);
+        sb_c(&tb, ':');
+        {
+            char long_form[STEXT];
+            sb_t lf;
+            sb_init(&lf, long_form, sizeof long_form);
+            sb_s(&lf, tb.p);
+            if (q->t == SN_NOT) {
+                sb_s(&lf, " everything in U that is NOT in ");
+                sb_sn(&lf, q->l, 0);
+                sb_c(&lf, '.');
+            } else if (q->t == SN_OR) {
+                sb_s(&lf, " the elements in ");
+                sb_sn(&lf, q->l, 2);
+                sb_s(&lf, " or in ");
+                sb_sn(&lf, q->r, 2);
+                sb_s(&lf, " (or both).");
+            } else {
+                sb_s(&lf, " the elements in both ");
+                sb_sn(&lf, q->l, 2);
+                sb_s(&lf, " and ");
+                sb_sn(&lf, q->r, 2);
+                sb_c(&lf, '.');
+            }
+            if (wrap_draw(long_form, 0, 0, COLS, 100, 0, false) <= 2) sb_s(&tb, long_form + tb.len);
+            else sb_c(&tb, '.');
+        }
+        vtail(" Its regions are lit up.");
+        sb_init(&bp, pre, sizeof pre);
+        sb_s(&bp, "n(");
+        sb_sn(&bp, se_ord[i], 0);
+        sb_c(&bp, ')');
+        sb_init(&bs, sym, sizeof sym);
+        sb_init(&bn, num, sizeof num);
+        sb_regsum(&bn, set);
+        vcalc(pre, sym, num);
+    }
+    set = se_eval(sn_root);
+    total = se_count(set);
+    vfilled = (uint8_t)(vn_k == 2 ? 0x0F : 0xFF);
+    st_final(EQ_NONE);
+    st_ptr->vfill = vfilled;
+    st_ptr->vhl = set;
+    sb_s(&tb, "Final answer: n(");
+    sb_sn(&tb, sn_root, 0);
+    sb_s(&tb, ") = ");
+    sb_n(&tb, total);
+    sb_c(&tb, '.');
+    vtail(" The regions that are lit up add up to this.");
+    sb_init(&bp, pre, sizeof pre);
+    sb_s(&bp, "n(");
+    sb_sn(&bp, sn_root, 0);
+    sb_c(&bp, ')');
+    sb_init(&bs, sym, sizeof sym);
+    sb_init(&bn, num, sizeof num);
+    usets = se_union_sets(sn_root);
+    {
+        const sn_t *q = &sn[sn_root];
+        if (q->t == SN_NOT) {
+            sb_s(&bs, "n(U) - n(");
+            sb_sn(&bs, q->l, 0);
+            sb_c(&bs, ')');
+            sb_n(&bn, vn_f[VF_U]);
+            sb_s(&bn, " - ");
+            sb_n(&bn, se_count(se_eval(q->l)));
+            sb_s(&bn, " = ");
+            sb_n(&bn, total);
+        } else if (q->t == SN_OR && usets == 7) {
+            sb_s(&bs, "n(A) + n(B) + n(C) - n(A n B) - n(A n C) - n(B n C) + n(A n B n C)");
+            sb_n(&bn, vn_f[VF_A]);
+            sb_s(&bn, " + ");
+            sb_n(&bn, vn_f[VF_B]);
+            sb_s(&bn, " + ");
+            sb_n(&bn, vn_f[VF_C]);
+            sb_s(&bn, " - ");
+            sb_n(&bn, vn_f[VF_AB]);
+            sb_s(&bn, " - ");
+            sb_n(&bn, vn_f[VF_AC]);
+            sb_s(&bn, " - ");
+            sb_n(&bn, vn_f[VF_BC]);
+            sb_s(&bn, " + ");
+            sb_n(&bn, vn_f[VF_ABC]);
+            sb_s(&bn, " = ");
+            sb_n(&bn, total);
+        } else if (q->t == SN_OR && (usets == 3 || usets == 5 || usets == 6)) {
+            int x = usets == 6 ? 1 : 0, y = usets == 3 ? 1 : 2;
+            sb_s(&bs, "n(");
+            sb_c(&bs, (char)('A' + x));
+            sb_s(&bs, ") + n(");
+            sb_c(&bs, (char)('A' + y));
+            sb_s(&bs, ") - n(");
+            sb_c(&bs, (char)('A' + x));
+            sb_s(&bs, " n ");
+            sb_c(&bs, (char)('A' + y));
+            sb_c(&bs, ')');
+            sb_n(&bn, vn_set_total(x));
+            sb_s(&bn, " + ");
+            sb_n(&bn, vn_set_total(y));
+            sb_s(&bn, " - ");
+            sb_n(&bn, vn_pair_total(x, y));
+            sb_s(&bn, " = ");
+            sb_n(&bn, total);
+        } else {
+            sb_regsum(&bn, set);
+        }
+    }
+    vcalc(pre, sym, num);
+    res.kind = RK_NONE;
+    res.num = total;
+    return true;
+}
+
+/* all the steps of a Venn problem; false with vn_head / vn_msg set */
+static bool solve_venn(void)
+{
+    steps_reset();
+    res.type = PT_VENN;
+    vn_head = 0;
+    vn_at = -1;
+    if (!venn_fill()) return false;
+    if (vn_expr[0]) {
+        if (!venn_expr()) return false;
+        if (st_over) { vn_msg[0] = 0; vn_head = "That expression needs too many steps for me."; return false; }
+        return true;
+    }
+    vfilled = (uint8_t)(vn_k == 2 ? 0x0F : 0xFF);
+    st_final(EQ_NONE);
+    st_ptr->vfill = vfilled;
+    st_ptr->vhl = 0;
+    sb_s(&tb, "Final answer: the diagram is complete. Add all the regions to check that they make n(U).");
+    sb_regsum(&sbs, vfilled);
+    sb_s(&sbs, " = n(U)");
+    return true;
+}
+
+/* ------------------------------------------------------------------ */
 /* Classifying and solving                                             */
 /* ------------------------------------------------------------------ */
 typedef struct {
@@ -1872,6 +3091,7 @@ static bool classify(const char *in, cls_t *c)
         return true;
     }
     if (!has_x(root)) {
+        if (has_sqrt(root)) { c->type = PT_RADICAL; return true; }
         if (has_div(root)) {
             if (frac_shape(root)) { c->type = PT_FRAC; return true; }
             c->why = fr_err ? fr_err : "I can only do two fractions at a time. Write a division like (1/2)/(3/4).";
@@ -1896,6 +3116,7 @@ static bool generate(const char *in, uint8_t type)
     g_fail = 0;
     steps_reset();
     if (root < 0) { g_fail = perr; return false; }
+    if (type == PT_RADICAL) return solve_radical(root);
     if (type == PT_FRAC) {
         if (!frac_shape(root)) { g_fail = fr_err ? fr_err : "I can only do two fractions at a time."; return false; }
         return solve_frac();
@@ -1950,6 +3171,22 @@ static void tick_wait(void)
 }
 
 static uint8_t keys[8], prev_keys[8];
+static jmp_buf quit_jb;             /* DEL jumps back to main(), which calls gfx_End() */
+
+/* DEL is the panic key. On the keypad matrix, three other keys held together
+   (one in DEL's column, one in its row-mate's row and one sharing a column with
+   a key of DEL's row) read exactly like DEL, so a DEL that those keys could
+   have faked is ignored; any DEL on its own is real. */
+static bool del_hit(void)
+{
+    uint8_t c, g;
+    if (!(keys[1] & kb_Del)) return false;
+    for (g = 2; g < 8; g++) {
+        if (!(keys[g] & 0x80)) continue;
+        for (c = 0; c < 7; c++) if ((keys[1] & (1 << c)) && (keys[g] & (1 << c))) return false;
+    }
+    return true;
+}
 
 static void read_keys(void)
 {
@@ -1958,6 +3195,10 @@ static void read_keys(void)
     kb_Scan();
     for (i = 1; i < 8; i++) keys[i] = kb_Data[i];
     keys[0] = 0;
+    if (del_hit()) {
+        TEST_HOOK(test_del_quit());
+        longjmp(quit_jb, 1);                     /* quit at once, from any screen */
+    }
 }
 
 #define KDOWN(g, m) ((keys[g] & (m)) != 0)
@@ -1978,7 +3219,20 @@ static bool nav_left(void) { return rep_key(0, KDOWN(7, kb_Left), KPRESS(7, kb_L
 static bool nav_right(void) { return rep_key(1, KDOWN(7, kb_Right), KPRESS(7, kb_Right)); }
 static bool nav_up(void) { return rep_key(2, KDOWN(7, kb_Up), KPRESS(7, kb_Up)); }
 static bool nav_down(void) { return rep_key(3, KDOWN(7, kb_Down), KPRESS(7, kb_Down)); }
-static bool key_del(void) { return rep_key(4, KDOWN(1, kb_Del), KPRESS(1, kb_Del)); }
+/* CLEAR is the backspace key (DEL is the panic key) */
+static bool key_back(void) { return rep_key(4, KDOWN(6, kb_Clear), KPRESS(6, kb_Clear)); }
+
+/* any key went down this tick, other than 2nd itself */
+static bool any_press(void)
+{
+    uint8_t g;
+    for (g = 1; g < 8; g++) {
+        uint8_t m = (uint8_t)(keys[g] & (uint8_t)~prev_keys[g]);
+        if (g == 1) m &= (uint8_t)~kb_2nd;
+        if (m) return true;
+    }
+    return false;
+}
 static bool key_enter(void) { return KPRESS(6, kb_Enter); }
 static bool key_submit(void) { return KPRESS(6, kb_Enter) || KPRESS(1, kb_Graph); }
 static bool key_ok(void) { return KPRESS(6, kb_Enter) || KPRESS(1, kb_2nd); }
@@ -2107,7 +3361,7 @@ static void hist_load(void)
     if (hist.n > HIST_N) hist.n = 0;
     for (i = 0; i < hist.n; i++) {
         hist.s[i][MAXIN] = 0;
-        if (hist.t[i] < PT_LINEAR || hist.t[i] > PT_FRAC || hist.s[i][0] == 0) { hist.n = 0; break; }
+        if (hist.t[i] < PT_LINEAR || hist.t[i] > PT_RADICAL || hist.s[i][0] == 0) { hist.n = 0; break; }
     }
 }
 
@@ -2151,7 +3405,7 @@ static void hist_add(const char *s, uint8_t type)
 /* ------------------------------------------------------------------ */
 /* Title and help                                                      */
 /* ------------------------------------------------------------------ */
-enum { SC_TITLE, SC_INPUT, SC_STEPS, SC_END, SC_HIST, SC_HELP, SC_ERROR, SC_CHOOSE };
+enum { SC_TITLE, SC_INPUT, SC_STEPS, SC_END, SC_HIST, SC_HELP, SC_ERROR, SC_CHOOSE, SC_VENN };
 
 static void draw_menu(const char *const *it, uint8_t n, uint8_t sel, int y0, int dy)
 {
@@ -2168,32 +3422,37 @@ static void draw_menu(const char *const *it, uint8_t n, uint8_t sel, int y0, int
 
 static uint8_t title_sel;
 
+/* returns 0 new problem, 1 Venn 2 sets, 2 Venn 3 sets, 3 history, 4 help, 5 quit */
 static uint8_t title_screen(void)
 {
-    static const char *const it[4] = { "New problem", "History (last problems)", "How to type, what it can do", "Quit" };
+    static const char *const it[6] = {
+        "New problem", "Venn diagram: 2 sets", "Venn diagram: 3 sets", "History (last problems)",
+        "How to type, what it can do", "Quit"
+    };
     screen_begin(SC_TITLE);
     for (;;) {
         tick_wait();
         read_keys();
         if (nav_up() && title_sel > 0) { title_sel--; dirty = true; }
-        if (nav_down() && title_sel < 3) { title_sel++; dirty = true; }
+        if (nav_down() && title_sel < 5) { title_sel++; dirty = true; }
         if (key_ok()) return title_sel;
-        if (key_clear()) return 3;
+        if (key_clear()) return 5;
         if (dirty) {
             draw_bg();
             fill(0, 0, SCR_W, 56, C_HEAD);
             txt_big("StepMath CE", 28, 12, C_WHITE, 3);
             txt_c("learn the METHOD, one step at a time", 44, C_YELLOW);
-            draw_menu(it, 4, title_sel, 80, 24);
-            txt_c("Equations, derivatives, fractions...", 190, C_GRAY);
-            txt_c("UP/DOWN: choose    ENTER: go", 214, C_GRAY);
+            draw_menu(it, 6, title_sel, 66, 20);
+            txt_c("Equations, derivatives, fractions, Venn", 192, C_GRAY);
+            txt_c("UP/DOWN: choose    ENTER: go", 206, C_GRAY);
+            txt_c("DEL = quit the program, from any screen", 220, C_RED);
             present();
             dirty = false;
         }
     }
 }
 
-#define HELP_PAGES 3
+#define HELP_PAGES 5
 static const char *const HELP[HELP_PAGES][10] = {
     { "What I can do", "",
       "1 Linear equation    3x+5=20",
@@ -2201,27 +3460,45 @@ static const char *const HELP[HELP_PAGES][10] = {
       "3 Simplify           3(x+2)+4x",
       "4 Derivative d/dx    x^3+2x",
       "5 Fractions          1/2+3/4",
-      "                     (1/2)/(3/4)",
-      "I show ONE step at a time. Anything",
-      "else gets a plain 'cannot solve'." },
+      "6 Square roots       sqrt(25)+3",
+      "7 Venn diagrams      2 or 3 sets",
+      "I show ONE step at a time." },
     { "How to type", "",
       "0-9, the X key (x), + - * / ^ ( )",
       "(-) also types a minus sign",
       "Y= key types the equals sign =",
       "x^2 key types ^2",
-      "3x means 3*x, 2(x+1), x(x-2) too",
-      "DEL erases, arrows move the cursor",
-      "ENTER or GRAPH solves it",
-      "CLEAR clears; again on empty: menu" },
+      "2nd, then x^2 types sqrt(   (2nd",
+      "lights up; it goes off after the",
+      "next key). CLEAR erases a character,",
+      "MODE clears the line. ENTER solves." },
+    { "Venn diagrams", "",
+      "Pick Venn 2 sets / 3 sets in the menu",
+      "and fill in the numbers. n(A n B) is",
+      "EVERYTHING in A and B. Optional: an",
+      "expression with A B C, n(and), u(or),",
+      "'(not): n(A u B)'  n(A u B)' n C",
+      "MATH=A APPS=B PRGM=C LOG=n VARS=u",
+      "comma key = ' (complement) ( ) as usual",
+      "Numbers 0 to 999." },
     { "Limits", "",
       "Whole numbers up to 4 digits, no",
       "decimals. Only the letter x.",
       "Quadratics: a, b, c within +-10000.",
       "No complex numbers: D < 0 gives",
       "'no real solutions'.",
-      "Derivatives: sums of terms like 3x^2",
-      "(no chain, product, quotient rule).",
-      "Fractions: two at a time." }
+      "sqrt( takes whole numbers; one kind of",
+      "root per expression.",
+      "Derivatives: 3x^2 sums. Fractions: 2." },
+    { "DEL = QUIT", "",
+      "DEL quits the program AT ONCE, from",
+      "any screen. No question is asked and",
+      "nothing is saved: a problem you are",
+      "in the middle of is lost.",
+      "Use it as a panic button.",
+      "(Erasing is on the CLEAR key.)",
+      "",
+      "" }
 };
 
 static void draw_help(uint8_t page)
@@ -2273,22 +3550,48 @@ static const keymap_t KM[] = {
 };
 #define NKM ((int)(sizeof KM / sizeof KM[0]))
 
-static void input_insert(const char *s)
+/* insert s at the cursor of buf (len chars, at most cap) */
+static void str_insert(char *buf, uint8_t *len, uint8_t *cur, uint8_t cap, const char *s)
 {
     uint8_t n = (uint8_t)strlen(s);
-    if (plen + n > MAXIN) return;
-    memmove(prob + pcur + n, prob + pcur, (size_t)(plen - pcur) + 1);
-    memcpy(prob + pcur, s, n);
-    pcur = (uint8_t)(pcur + n);
-    plen = (uint8_t)(plen + n);
+    if (*len + n > cap) return;
+    memmove(buf + *cur + n, buf + *cur, (size_t)(*len - *cur) + 1);
+    memcpy(buf + *cur, s, n);
+    *cur = (uint8_t)(*cur + n);
+    *len = (uint8_t)(*len + n);
 }
 
-static void input_delete(void)
+/* erase the character before the cursor (a whole sqrt( at once) */
+static void str_delete(char *buf, uint8_t *len, uint8_t *cur)
 {
-    if (pcur == 0) return;
-    memmove(prob + pcur - 1, prob + pcur, (size_t)(plen - pcur) + 1);
-    pcur--;
-    plen--;
+    uint8_t n = 1;
+    if (*cur == 0) return;
+    if (*cur >= 5 && memcmp(buf + *cur - 5, "sqrt(", 5) == 0) n = 5;
+    memmove(buf + *cur - n, buf + *cur, (size_t)(*len - *cur) + 1);
+    *cur = (uint8_t)(*cur - n);
+    *len = (uint8_t)(*len - n);
+}
+
+static void input_insert(const char *s) { str_insert(prob, &plen, &pcur, MAXIN, s); }
+static void input_delete(void) { str_delete(prob, &plen, &pcur); }
+
+static bool second;                /* the 2nd key is lit: the next key types its second function */
+
+/* the 2nd indicator, like the little arrow on the real calculator */
+static void draw_2nd(bool on)
+{
+    int x = 232, y = 21;
+    if (on) {
+        fill(x, y, 80, 14, C_YELLOW);
+        txt("2nd", x + 6, y + 3, C_BLACK);
+        gfx_SetColor(C_BLACK);
+        gfx_FillTriangle(x + 40, y + 11, x + 50, y + 11, x + 45, y + 3);
+        txt("lit", x + 56, y + 3, C_BLACK);
+    } else {
+        gfx_SetColor(C_DKGRAY);
+        gfx_Rectangle(x, y, 80, 14);
+        txt("2nd", x + 6, y + 3, C_DKGRAY);
+    }
 }
 
 static void draw_input(bool blink)
@@ -2298,6 +3601,7 @@ static void draw_input(bool blink)
     draw_bg();
     draw_header("New problem");
     txt("Type your problem:", 8, 24, C_YELLOW);
+    draw_2nd(second);
     fill(4, 38, 312, 22, C_PANEL);
     fill(4, 38, 312, 1, C_GRAY);
     fill(4, 59, 312, 1, C_GRAY);
@@ -2307,16 +3611,20 @@ static void draw_input(bool blink)
     sb_n(&s, plen);
     sb_c(&s, '/');
     sb_n(&s, MAXIN);
-    txt(buf, SCR_W - 8 - txt_w(buf), 26, C_GRAY);
+    txt(buf, SCR_W - 8 - txt_w(buf), 63, C_GRAY);
     txt("Keys: 0-9  X  + - * / ^ ( )", 8, 72, C_CYAN);
-    txt("Y= types =     x^2 key types ^2", 8, 84, C_CYAN);
-    txt("DEL erases   arrows move the cursor", 8, 96, C_CYAN);
-    txt("Examples:", 8, 116, C_YELLOW);
-    txt("3x+5=20        x^2-5x+6=0", 8, 128, C_WHITE);
-    txt("3(x+2)+4x      x^3+2x (d/dx)", 8, 140, C_WHITE);
-    txt("1/2+3/4        (1/2)/(3/4)", 8, 152, C_WHITE);
-    txt("ENTER or GRAPH: solve", 8, 184, C_GREEN);
-    txt("CLEAR: clear the line (empty: menu)", 8, 198, C_GRAY);
+    txt("Y= types =     x^2 key types ^2", 8, 83, C_CYAN);
+    txt("2nd then x^2 types sqrt(", 8, 94, second ? C_YELLOW : C_CYAN);
+    txt("CLEAR erases   MODE clears the line", 8, 105, C_CYAN);
+    txt("arrows move the cursor", 8, 116, C_CYAN);
+    txt("Examples:", 8, 130, C_YELLOW);
+    txt("3x+5=20        x^2-5x+6=0", 8, 141, C_WHITE);
+    txt("3(x+2)+4x      x^3+2x (d/dx)", 8, 152, C_WHITE);
+    txt("1/2+3/4        (1/2)/(3/4)", 8, 163, C_WHITE);
+    txt("(-5+sqrt(5^2-4*1*6))/(2*1)", 8, 174, C_WHITE);
+    txt("ENTER or GRAPH: solve", 8, 190, C_GREEN);
+    txt("CLEAR on an empty line: menu", 8, 202, C_GRAY);
+    txt("DEL: QUIT the program (any screen)", 8, 216, C_RED);
 }
 
 /* returns true to solve, false to go back to the menu */
@@ -2324,24 +3632,34 @@ static bool input_screen(void)
 {
     uint8_t blink = 0;
     screen_begin(SC_INPUT);
+    second = false;
+    plen = (uint8_t)strlen(prob);               /* whatever was put in prob, the cursor must lie inside it */
+    if (pcur > plen) pcur = plen;
     for (;;) {
         int i;
         tick_wait();
         read_keys();
         if (++blink >= 30) { blink = 0; dirty = true; }
-        for (i = 0; i < NKM; i++) {
-            if (KPRESS(KM[i].g, KM[i].m)) { input_insert(KM[i].s); dirty = true; blink = 0; }
+        if (KPRESS(1, kb_2nd)) {
+            second = !second;                     /* 2nd lights up, or goes off again */
+            dirty = true;
+            blink = 0;
         }
-        if (key_del()) { input_delete(); dirty = true; blink = 0; }
+        for (i = 0; i < NKM; i++) {
+            if (KPRESS(KM[i].g, KM[i].m)) {
+                if (second && KM[i].g == 2 && KM[i].m == kb_Square) input_insert("sqrt(");
+                else input_insert(KM[i].s);
+                dirty = true;
+                blink = 0;
+            }
+        }
+        if (KPRESS(6, kb_Clear) && plen == 0) return false;
+        if (KPRESS(1, kb_Mode)) { prob[0] = 0; plen = pcur = 0; dirty = true; blink = 0; }
+        if (key_back()) { input_delete(); dirty = true; blink = 0; }
         if (nav_left() && pcur > 0) { pcur--; dirty = true; blink = 0; }
         if (nav_right() && pcur < plen) { pcur++; dirty = true; blink = 0; }
-        if (key_clear()) {
-            if (plen == 0) return false;
-            prob[0] = 0;
-            plen = pcur = 0;
-            dirty = true;
-        }
         if (key_submit() && plen > 0) return true;
+        if (any_press() && second) { second = false; dirty = true; }     /* one-shot, like the real calculator */
         if (dirty) {
             draw_input(blink < 15);
             present();
@@ -2406,9 +3724,12 @@ static uint8_t choose_screen(void)
 /* ------------------------------------------------------------------ */
 /* Showing the steps                                                   */
 /* ------------------------------------------------------------------ */
+static void draw_steps_venn(int cur);
+
 static void draw_steps(int cur)
 {
     char b[24];
+    if (ptype == PT_VENN) { draw_steps_venn(cur); return; }
     sb_t s;
     const step_t *st = &steps[cur];
     draw_bg();
@@ -2513,6 +3834,299 @@ static uint8_t run_problem(uint8_t type)
 }
 
 /* ------------------------------------------------------------------ */
+/* Venn diagram screens                                                */
+/* ------------------------------------------------------------------ */
+#define VB_X 6
+#define VB_Y 102
+#define VB_W 196
+#define VB_H 104
+/* circles (centre x, centre y, radius) inside the box, and where the counts go */
+static const int16_t VC2[2][3] = { { 78, 54, 36 }, { 118, 54, 36 } };
+static const int16_t VC3[3][3] = { { 81, 42, 31 }, { 115, 42, 31 }, { 98, 70, 31 } };
+static const int16_t VL2[4][2] = { { 0, 0 }, { 62, 54 }, { 134, 54 }, { 98, 54 } };
+static const int16_t VL3[8][2] = { { 0, 0 }, { 69, 33 }, { 127, 33 }, { 98, 29 }, { 98, 85 }, { 79, 62 }, { 117, 62 }, { 98, 51 } };
+static const int16_t VN2[2][2] = { { 28, 50 }, { 160, 50 } };
+static const int16_t VN3[3][2] = { { 36, 38 }, { 152, 38 }, { 134, 66 } };
+
+static void venn_text_c(const char *s, int cx, int cy, uint8_t c)
+{
+    txt(s, VB_X + cx - txt_w(s) / 2, VB_Y + cy - 4, c);
+}
+
+/* the diagram: regions in `fill` show their count, regions in `hl` are lit up */
+static void venn_draw(uint8_t k, uint8_t fill_set, uint8_t hl)
+{
+    const int16_t (*cc)[3] = k == 2 ? VC2 : VC3;
+    const int16_t (*ll)[2] = k == 2 ? VL2 : VL3;
+    static const uint8_t setcol[3] = { C_CYAN, C_GREEN, C_ORANGE };
+    int y, i, j, nm = 1 << k;
+    char b[12];
+    sb_t s;
+    fill(VB_X, VB_Y, VB_W, VB_H, (hl & 1) ? C_VHL0 : C_BOX);
+    for (y = 0; y < VB_H; y++) {
+        int xs[8], lo[3], hi[3], n = 0;
+        xs[n++] = 0;
+        xs[n++] = VB_W;
+        for (i = 0; i < k; i++) {
+            int dy = y - cc[i][1], r = cc[i][2], half;
+            lo[i] = hi[i] = -1;
+            if (dy < -r || dy > r) continue;
+            half = (int)isqrtl((long)r * r - (long)dy * dy);
+            lo[i] = cc[i][0] - half;
+            hi[i] = cc[i][0] + half + 1;
+            xs[n++] = lo[i];
+            xs[n++] = hi[i];
+        }
+        for (i = 1; i < n; i++) {                       /* sort the break points */
+            int v = xs[i];
+            for (j = i; j > 0 && xs[j - 1] > v; j--) xs[j] = xs[j - 1];
+            xs[j] = v;
+        }
+        for (i = 0; i + 1 < n; i++) {
+            int xa = xs[i], xb = xs[i + 1], m = 0;
+            if (xb <= xa) continue;
+            for (j = 0; j < k; j++) if (lo[j] >= 0 && xa >= lo[j] && xa < hi[j]) m |= 1 << j;
+            if (m == 0) continue;
+            gfx_SetColor((hl & (1 << m)) ? C_VHL : (fill_set & (1 << m)) ? C_VR((uint8_t)m) : C_VUNK);
+            gfx_HorizLine(VB_X + xa, VB_Y + y, xb - xa);
+        }
+    }
+    for (i = 0; i < k; i++) {
+        gfx_SetColor(setcol[i]);
+        gfx_Circle(VB_X + cc[i][0], VB_Y + cc[i][1], (uint24_t)cc[i][2]);
+        gfx_Circle(VB_X + cc[i][0], VB_Y + cc[i][1], (uint24_t)(cc[i][2] - 1));
+        b[0] = (char)('A' + i);
+        b[1] = 0;
+        venn_text_c(b, k == 2 ? VN2[i][0] : VN3[i][0], k == 2 ? VN2[i][1] : VN3[i][1], setcol[i]);
+    }
+    gfx_SetColor(C_GRAY);
+    gfx_Rectangle(VB_X, VB_Y, VB_W, VB_H);
+    for (i = 1; i < nm; i++) {
+        sb_init(&s, b, sizeof b);
+        if (fill_set & (1 << i)) sb_n(&s, vr[i]);
+        else sb_c(&s, '?');
+        venn_text_c(b, ll[i][0], ll[i][1], (hl & (1 << i)) ? C_BLACK : (fill_set & (1 << i)) ? C_WHITE : C_GRAY);
+    }
+    sb_init(&s, b, sizeof b);
+    sb_s(&s, "U=");
+    sb_n(&s, vn_f[VF_U]);
+    txt(b, VB_X + 4, VB_Y + 3, C_GRAY);
+    sb_init(&s, b, sizeof b);
+    sb_s(&s, "out ");
+    if (fill_set & 1) sb_n(&s, vr[0]);
+    else sb_c(&s, '?');
+    txt(b, VB_X + 4, VB_Y + VB_H - 12, (fill_set & 1) ? C_WHITE : C_GRAY);
+}
+
+static char vsum[160];                 /* the Venn problem as one line of text */
+
+static void venn_make_summary(void)
+{
+    sb_t s;
+    static const char *const nm[VF_N] = { "U", "A", "B", "C", "AnB", "AnC", "BnC", "AnBnC", "out" };
+    static const uint8_t k2[] = { VF_U, VF_A, VF_B, VF_AB, VF_NONE };
+    static const uint8_t k3[] = { VF_U, VF_A, VF_B, VF_C, VF_AB, VF_AC, VF_BC, VF_ABC, VF_NONE };
+    const uint8_t *f = vn_k == 2 ? k2 : k3;
+    int i, n = vn_k == 2 ? 5 : 9;
+    sb_init(&s, vsum, sizeof vsum);
+    for (i = 0; i < n; i++) {
+        if (vn_f[f[i]] < 0) continue;
+        if (s.len) sb_c(&s, ' ');
+        sb_s(&s, nm[f[i]]);
+        sb_c(&s, '=');
+        sb_n(&s, vn_f[f[i]]);
+    }
+    if (vn_expr[0]) {
+        sb_s(&s, "  find ");
+        sb_s(&s, vn_expr);
+    }
+    while (wrap_draw(vsum, 0, 0, COLS, 100, 0, false) > 2 && s.len > 4) {       /* two lines of text at most */
+        s.len = (uint16_t)(s.len - 1);
+        vsum[s.len] = 0;
+        if (s.len > 3) { vsum[s.len - 1] = '.'; vsum[s.len - 2] = '.'; vsum[s.len - 3] = '.'; }
+    }
+}
+
+static void draw_steps_venn(int cur)
+{
+    char b[24];
+    sb_t s;
+    const step_t *st = &steps[cur];
+    draw_bg();
+    draw_header(vn_k == 2 ? "Venn: 2 sets" : "Venn: 3 sets");
+    txt("Problem:", 8, 20, C_GRAY);
+    wrap_draw(vsum, 8, 30, COLS, 2, C_WHITE, true);
+    fill(4, 52, 312, 1, C_DKGRAY);
+    sb_init(&s, b, sizeof b);
+    if (st->fin) sb_s(&s, "Final answer");
+    else { sb_s(&s, "Step "); sb_n(&s, cur + 1); }
+    txt(b, 8, 55, st->fin ? C_GREEN : C_YELLOW);
+    if (cur > 0) txt("<- back", SCR_W - 8 - 7 * 8, 55, C_GRAY);
+    wrap_draw(st->text, 8, 66, COLS, 3, C_WHITE, true);
+    venn_draw(vn_k, st->vfill, st->vhl);
+    fill(VB_X + VB_W + 4, VB_Y, SCR_W - (VB_X + VB_W + 4) - 4, VB_H, C_PANEL);
+    fill(VB_X + VB_W + 4, VB_Y, SCR_W - (VB_X + VB_W + 4) - 4, 1, st->fin ? C_GREEN : C_GRAY);
+    wrap_draw(st->state, VB_X + VB_W + 8, VB_Y + 5, VCOLS, 10, st->fin ? C_GREEN : C_CYAN, true);
+    txt(st->fin ? "ENTER: what next?" : "ENTER or -> : next step", 8, 214, C_GREEN);
+    txt("<-: back   CLEAR: edit numbers", 8, 226, C_GRAY);
+}
+
+/* ---- the form ---- */
+/* the keys that type the set expression (A B C are the letters printed on MATH APPS PRGM) */
+static const keymap_t VK[] = {
+    { 2, kb_Math, "A" }, { 3, kb_Apps, "B" }, { 4, kb_Prgm, "C" }, { 2, kb_Log, "n" }, { 5, kb_Vars, "u" },
+    { 3, kb_Comma, "'" }, { 4, kb_LParen, "(" }, { 5, kb_RParen, ")" }
+};
+#define NVK ((int)(sizeof VK / sizeof VK[0]))
+static char vf_txt[VF_N][4];
+static uint8_t vf_sel, ecur;
+static const uint8_t VROWS2[5] = { VF_U, VF_A, VF_B, VF_AB, VF_NONE };
+static const uint8_t VROWS3[9] = { VF_U, VF_A, VF_B, VF_C, VF_AB, VF_AC, VF_BC, VF_ABC, VF_NONE };
+static const char *const VF_HINT[VF_N] = {
+    "all elements", "in A", "in B", "in C", "in A and B", "in A and C", "in B and C", "in all three", "in none (opt.)"
+};
+
+static void vf_clear(void)
+{
+    memset(vf_txt, 0, sizeof vf_txt);
+    vn_expr[0] = 0;
+    vf_sel = 0;
+    ecur = 0;
+}
+
+static void vf_collect(void)
+{
+    int i;
+    for (i = 0; i < VF_N; i++) {
+        long v = 0;
+        const char *p = vf_txt[i];
+        if (!*p) { vn_f[i] = -1; continue; }
+        while (*p) v = v * 10 + (*p++ - '0');
+        vn_f[i] = v;
+    }
+}
+
+static void draw_vform(bool blink)
+{
+    const uint8_t *rows = vn_k == 2 ? VROWS2 : VROWS3;
+    int nr = vn_k == 2 ? 5 : 9, dy = vn_k == 2 ? 16 : 13, y0 = vn_k == 2 ? 24 : 22, i, y;
+    draw_bg();
+    draw_header(vn_k == 2 ? "Venn: 2 sets" : "Venn: 3 sets");
+    for (i = 0; i < nr; i++) {
+        int f = rows[i];
+        y = y0 + i * dy;
+        if (i == vf_sel) fill(4, y - 2, 312, dy - 1, C_HEAD);
+        txt(VF_LABEL[f], 10, y, i == vf_sel ? C_WHITE : C_GRAY);
+        txt(VF_HINT[f], 112, y, C_DKGRAY);
+        fill(250, y - 2, 40, 11, C_PANEL);
+        txt(vf_txt[f], 254, y, C_YELLOW);
+        if (i == vf_sel && blink) fill(254 + 8 * (int)strlen(vf_txt[f]), y + 7, 8, 2, C_YELLOW);
+    }
+    y = y0 + nr * dy + 4;
+    if (vf_sel == nr) fill(4, y - 2, 312, 12, C_HEAD);
+    txt("Evaluate (optional), e.g. n(A u B)':", 8, y, vf_sel == nr ? C_WHITE : C_GRAY);
+    fill(4, y + 11, 312, 14, C_PANEL);
+    txt(vn_expr, 8, y + 14, C_WHITE);
+    if (vf_sel == nr && blink) fill(8 + 8 * ecur, y + 22, 8, 2, C_YELLOW);
+    y += 30;
+    txt("MATH=A APPS=B PRGM=C  LOG=n VARS=u", 8, y, C_CYAN);
+    txt("n: intersection (and)  u: union (or)", 8, y + 10, C_CYAN);
+    txt("comma key types ' (complement)", 8, y + 20, C_CYAN);
+    txt("UP/DOWN field  GRAPH solve  MODE menu", 8, 206, C_GREEN);
+    txt("CLEAR erases   DEL: quit the program", 8, 218, C_GRAY);
+}
+
+/* returns true to solve, false to go back to the title */
+static bool venn_form(void)
+{
+    const uint8_t *rows = vn_k == 2 ? VROWS2 : VROWS3;
+    int nr = vn_k == 2 ? 5 : 9, i;
+    uint8_t blink = 0;
+    screen_begin(SC_VENN);
+    for (;;) {
+        tick_wait();
+        read_keys();
+        if (++blink >= 30) { blink = 0; dirty = true; }
+        if (nav_up() && vf_sel > 0) { vf_sel--; dirty = true; blink = 0; }
+        if (nav_down() && vf_sel < nr) { vf_sel++; dirty = true; blink = 0; }
+        if (vf_sel < nr) {
+            char *t = vf_txt[rows[vf_sel]];
+            size_t n = strlen(t);
+            for (i = 0; i < 10; i++) {
+                if (KPRESS(KM[i].g, KM[i].m) && n < 3) {
+                    t[n++] = KM[i].s[0];
+                    t[n] = 0;
+                    dirty = true;
+                    blink = 0;
+                }
+            }
+            if (key_back() && n > 0) { t[n - 1] = 0; dirty = true; blink = 0; }
+        } else {
+            uint8_t len = (uint8_t)strlen(vn_expr);
+            for (i = 0; i < NVK; i++) {
+                if (KPRESS(VK[i].g, VK[i].m)) {
+                    str_insert(vn_expr, &len, &ecur, MAXIN, VK[i].s);
+                    dirty = true;
+                    blink = 0;
+                }
+            }
+            if (key_back()) { str_delete(vn_expr, &len, &ecur); dirty = true; blink = 0; }
+            if (nav_left() && ecur > 0) { ecur--; dirty = true; blink = 0; }
+            if (nav_right() && ecur < len) { ecur++; dirty = true; blink = 0; }
+        }
+        if (KPRESS(1, kb_Mode)) return false;
+        if (KPRESS(1, kb_Graph)) return true;
+        if (KPRESS(6, kb_Enter)) {
+            if (vf_sel < nr) { vf_sel++; dirty = true; blink = 0; }
+            else return true;
+        }
+        if (dirty) {
+            draw_vform(blink < 15);
+            present();
+            dirty = false;
+        }
+    }
+}
+
+/* solves the form; false (after a message) when the numbers or the expression do not work */
+static bool venn_attempt(void)
+{
+    vf_collect();
+    venn_make_summary();
+    if (!solve_venn()) {
+        if (vn_at >= 0) {                      /* a mistake in the expression: show it with a pointer */
+            strncpy(prob, vn_expr, MAXIN);
+            prob[MAXIN] = 0;
+        } else {
+            strncpy(prob, vsum, MAXIN);
+            prob[MAXIN] = 0;
+        }
+        plen = pcur = (uint8_t)strlen(prob);
+        message_screen(vn_head ? vn_head : "I can't solve that.", vn_msg, vn_at);
+        return false;
+    }
+    strncpy(prob, vsum, MAXIN);
+    prob[MAXIN] = 0;
+    plen = pcur = (uint8_t)strlen(prob);
+    return true;
+}
+
+static void run_venn(uint8_t k)
+{
+    vn_k = k;
+    vf_clear();
+    for (;;) {
+        uint8_t r;
+        if (!venn_form()) return;
+        if (!venn_attempt()) continue;
+        ptype = PT_VENN;
+        r = steps_view();
+        if (r == RUN_NEW) vf_clear();
+        else if (r == RUN_MENU) return;
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* History                                                             */
 /* ------------------------------------------------------------------ */
 static void draw_hist(uint8_t sel)
@@ -2530,8 +4144,8 @@ static void draw_hist(uint8_t sel)
             txt(PT_NAME[hist.t[i]], 12, y + 12, C_CYAN);
         }
     }
-    txt("ENTER: solve it again   DEL: remove", 8, 214, C_GRAY);
-    txt("CLEAR: back", 8, 226, C_GRAY);
+    txt("ENTER: solve it again   MODE: remove", 8, 214, C_GRAY);
+    txt("CLEAR: back   DEL: quit the program", 8, 226, C_GRAY);
 }
 
 /* returns RUN_* when a problem was opened, or RUN_EDIT-less 255 to go back */
@@ -2545,7 +4159,7 @@ static uint8_t history_screen(void)
         if (key_clear()) return 255;
         if (nav_up() && sel > 0) { sel--; dirty = true; }
         if (nav_down() && sel + 1 < hist.n) { sel++; dirty = true; }
-        if (key_del() && hist.n > 0) {
+        if (KPRESS(1, kb_Mode) && hist.n > 0) {
             hist_remove(sel);
             hist_save(false);
             if (sel >= hist.n && sel > 0) sel--;
@@ -2587,9 +4201,14 @@ int main(void)
     prob[0] = 0;
     plen = pcur = 0;
     tick_reset();
+    if (setjmp(quit_jb) != 0) {
+        /* DEL was pressed on some screen: leave at once, saving nothing */
+        gfx_End();
+        return 0;
+    }
     for (;;) {
         m = title_screen();
-        if (m == 1) {
+        if (m == 3) {
             /* "Try another problem" from the history goes straight to a new input line */
             if (history_screen() == RUN_NEW) { prob[0] = 0; plen = pcur = 0; m = 0; }
         }
@@ -2601,9 +4220,11 @@ int main(void)
                 if (r == RUN_NEW) { prob[0] = 0; plen = pcur = 0; }
                 else if (r == RUN_MENU) break;
             }
-        } else if (m == 2) {
+        } else if (m == 1 || m == 2) {
+            run_venn((uint8_t)(m + 1));
+        } else if (m == 4) {
             help_screen();
-        } else if (m == 3) {
+        } else if (m == 5) {
             break;
         }
     }

@@ -11,6 +11,7 @@
  *         harness shots DIR                  screenshots
  */
 #include <stdio.h>
+#include <execinfo.h>
 #include <math.h>
 #include <ctype.h>
 #define main game_main
@@ -24,7 +25,11 @@ static unsigned fclock;
 clock_t fake_clock(void) { fclock += 137; return (clock_t)fclock; }
 
 static long trunc_n;
-void test_trunc(void) { trunc_n++; }
+void test_trunc(void)
+{
+    trunc_n++;
+    if (trunc_n == 1 && getenv("TRUNCBT")) { void *bt[16]; int n = backtrace(bt, 16); backtrace_symbols_fd(bt, n, 2); }
+}
 static int cur_present_screen = -1;
 static long present_count[16];
 static void on_present_hook(int screen);
@@ -988,7 +993,8 @@ static void run_random(long N)
 static void run_garbage(long N)
 {
     static const char alpha[] = "0123456789xx+-*/^()=0123xx(()) ";
-    static const char *const frag[] = { "x^2", "3x", "2(", "x+", "=0", "/2", "(x+1)", "-(", "x(x", "5)", "1/2", "+(1/3)", "x^", "10", "2x^2" };
+    static const char *const frag[] = { "x^2", "3x", "2(", "x+", "=0", "/2", "(x+1)", "-(", "x(x", "5)", "1/2", "+(1/3)", "x^", "10", "2x^2",
+                                     "sqrt(", "sqrt(4)", "2sqrt(3)", "sqrt(x)", "sqrt(2)+", ")/2", "(-3+", "sqrt(5^2-4*1*6)", "sqrt(sqrt(", "-sqrt(9)", "(1+sqrt(5))/2" };
     long i, solved = 0, refused = 0;
     for (i = 0; i < N; i++) {
         char in[60];
@@ -1015,6 +1021,13 @@ static void run_garbage(long N)
                     check_layout(in);
                     CHECK(res.type == t[q], "%s: result type", in);
                     /* generic truth checks */
+                    if (t[q] == PT_RADICAL && res.nroots == 1) {
+                        double want, got = ((double)res.root[0].u + (double)res.root[0].w * sqrt((double)res.root[0].m)) / (double)res.root[0].den;
+                        qp = in;
+                        want = q_expr();
+                        q_sp();
+                        CHECK(*qp != 0 || fabs(got - want) <= 1e-6 * (1 + fabs(want)), "%s: radical value %.9g vs %.9g", in, got, want);
+                    }
                     if (t[q] == PT_LINEAR || t[q] == PT_QUAD) {
                         long long c0, c1, c2, c3;
                         if (sample_equation(in, &c0, &c1, &c2, &c3) && c3 == c2 * 9 + c1 * 3 + c0) {
@@ -1045,18 +1058,604 @@ static void run_garbage(long N)
 }
 
 /* ---------------------------------------------------------------- */
+/* Venn diagrams: reference tests                                   */
+/* ---------------------------------------------------------------- */
+/* The reference builds the problem from the regions (so the right answer is
+ * known), feeds only the typed numbers to the game, and compares every region
+ * and the expression count with what it knows. Its expressions come from a
+ * generator that carries its own truth table. */
+typedef struct { int t, l, r, v; } gx_t;          /* t: 0 set, 1 not, 2 or, 3 and */
+static gx_t gx[64];
+static int ngx;
+static int gx_new(int t, int l, int r, int v) { gx[ngx].t = t; gx[ngx].l = l; gx[ngx].r = r; gx[ngx].v = v; return ngx++; }
+static int gx_rand(int depth, int k)
+{
+    int c = depth <= 0 ? 0 : (int)(rr() % 6);
+    if (c <= 1) return gx_new(0, -1, -1, (int)(rr() % (unsigned)k));
+    if (c == 2) return gx_new(1, gx_rand(depth - 1, k), -1, 0);
+    if (c <= 4) return gx_new(2, gx_rand(depth - 1, k), gx_rand(depth - 1, k), 0);
+    return gx_new(3, gx_rand(depth - 1, k), gx_rand(depth - 1, k), 0);
+}
+static int gx_truth(int i, int mask)
+{
+    switch (gx[i].t) {
+    case 0: return (mask >> gx[i].v) & 1;
+    case 1: return !gx_truth(gx[i].l, mask);
+    case 2: return gx_truth(gx[i].l, mask) || gx_truth(gx[i].r, mask);
+    default: return gx_truth(gx[i].l, mask) && gx_truth(gx[i].r, mask);
+    }
+}
+static int gx_prec(int i) { return gx[i].t == 2 ? 1 : gx[i].t == 3 ? 2 : 3; }
+/* own printer: minimal brackets, sometimes written as n( ... ) */
+static void gx_print(char *out, int i, int need)
+{
+    char a[200], b[200];
+    int br = gx_prec(i) < need;
+    switch (gx[i].t) {
+    case 0: sprintf(out, "%c", 'A' + gx[i].v); return;
+    case 1: gx_print(a, gx[i].l, 3); sprintf(out, "%s'", a); return;
+    default:
+        gx_print(a, gx[i].l, gx[i].t == 2 ? 1 : 2);
+        gx_print(b, gx[i].r, gx[i].t == 2 ? 1 : 2);
+        if (br) sprintf(out, "%s(%s%c%s)", (rr() % 3 == 0) ? "n" : "", a, gx[i].t == 2 ? 'u' : 'n', b);
+        else sprintf(out, "%s%c%s", a, gx[i].t == 2 ? 'u' : 'n', b);
+        return;
+    }
+}
+
+static long venn_checks_2, venn_checks_3, venn_incons, venn_nested, venn_expr_ok;
+static int venn_max_text, venn_max_state;
+
+/* the typed numbers of a problem built from the region counts R */
+static void venn_fields(int k, const long *R, int with_none)
+{
+    long U = 0, A = 0, B = 0, C = 0, AB = 0, AC = 0, BC = 0, ABC = 0;
+    int m;
+    for (m = 0; m < (1 << k); m++) {
+        U += R[m];
+        if (m & 1) A += R[m];
+        if (m & 2) B += R[m];
+        if (m & 4) C += R[m];
+        if ((m & 3) == 3) AB += R[m];
+        if ((m & 5) == 5) AC += R[m];
+        if ((m & 6) == 6) BC += R[m];
+        if (m == 7) ABC += R[m];
+    }
+    memset(vn_f, -1, sizeof vn_f);
+    vn_f[VF_U] = U; vn_f[VF_A] = A; vn_f[VF_B] = B; vn_f[VF_AB] = AB;
+    if (k == 3) { vn_f[VF_C] = C; vn_f[VF_AC] = AC; vn_f[VF_BC] = BC; vn_f[VF_ABC] = ABC; }
+    vn_f[VF_NONE] = with_none ? R[0] : -1;
+}
+
+/* the number at the end of a state line ("12 - 5 = 7"), or -1 */
+static long last_number(const char *s)
+{
+    const char *e = strrchr(s, '=');
+    return e ? atol(e + 1) : -1;
+}
+
+/* every piece of a state line made only of numbers and + - (like "12 + 9 - 5") must have the same value as the last one */
+static void check_num_chain(const char *state, const char *tag)
+{
+    char buf[400], *seg, *next;
+    double last = 0;
+    int have = 0, all;
+    clean_nb(state, buf);
+    for (seg = buf; seg; seg = next) {
+        char *e = strstr(seg, " = ");
+        int plain = 1;
+        char *c;
+        if (e) { *e = 0; next = e + 3; } else next = 0;
+        for (c = seg; *c; c++) if (!strchr("0123456789+- ", *c)) plain = 0;
+        if (!plain || !seg[0]) continue;
+        {
+            double v = q_eval(seg, &all);
+            if (have) CHECK(fabs(v - last) < 1e-9, "%s: '%s' is not an equal chain (%g vs %g)", tag, state, v, last);
+            last = v;
+            have = 1;
+        }
+    }
+}
+
+static void venn_check_layout(const char *tag)
+{
+    int i;
+    for (i = 0; i < nsteps; i++) {
+        int lt = wrap_draw(steps[i].text, 0, 0, COLS, 100, 0, false);
+        int ls = wrap_draw(steps[i].state, 0, 0, VCOLS, 100, 0, false);
+        if (lt > venn_max_text) venn_max_text = lt;
+        if (ls > venn_max_state) venn_max_state = ls;
+        CHECK(lt <= 3, "%s: step %d text needs %d lines", tag, i + 1, lt);
+        CHECK(ls <= 10, "%s: step %d state needs %d lines at 13 columns", tag, i + 1, ls);
+        CHECK(strstr(steps[i].state, "= -") == 0 && strstr(steps[i].text, "= -") == 0, "%s: step %d shows a negative count", tag, i + 1);
+        check_num_chain(steps[i].state, tag);
+        CHECK((steps[i].fin != 0) == (i == nsteps - 1), "%s: final flag on step %d", tag, i + 1);
+    }
+    CHECK(vsum[0] == 0 || wrap_draw(vsum, 0, 0, COLS, 100, 0, false) <= 2, "%s: problem line too long", tag);
+}
+
+/* one consistent problem: regions R, an optional expression text with its truth table */
+static void venn_case(int k, const long *R, int with_none, const char *expr, int tt_root, const char *tag)
+{
+    int m, nfill = k == 2 ? 4 : 8, i, want_steps;
+    uint8_t seen = 0;
+    long t0 = trunc_n;
+    vn_k = (uint8_t)k;
+    venn_fields(k, R, with_none);
+    strncpy(vn_expr, expr ? expr : "", MAXIN);
+    vn_expr[MAXIN] = 0;
+    venn_make_summary();
+    if (!solve_venn()) { FAIL("%s: refused a good problem: %s | %s", tag, vn_head ? vn_head : "?", vn_msg); return; }
+    if (k == 2) venn_checks_2++; else venn_checks_3++;
+    for (m = 0; m < (1 << k); m++) CHECK(vr[m] == R[m], "%s: region %d is %ld, wanted %ld", tag, m, vr[m], R[m]);
+    CHECK(trunc_n == t0, "%s: truncated", tag);
+    /* the fill steps: one region each, innermost first, the outside last */
+    {
+        static const int order2[4] = { 3, 1, 2, 0 };
+        static const int order3[8] = { 7, 3, 5, 6, 1, 2, 4, 0 };
+        const int *ord = k == 2 ? order2 : order3;
+        for (i = 0; i < nfill && i < nsteps; i++) {
+            uint8_t added = (uint8_t)(steps[i].vfill & ~seen);
+            CHECK(added == (1 << ord[i]), "%s: step %d fills mask %02x, wanted region %d", tag, i + 1, added, ord[i]);
+            CHECK(steps[i].vhl == (1 << ord[i]) || (ord[i] == 0 && steps[i].vhl == 1), "%s: step %d highlight %02x", tag, i + 1, steps[i].vhl);
+            CHECK(last_number(steps[i].state) == R[ord[i]], "%s: step %d state '%s' vs %ld", tag, i + 1, steps[i].state, R[ord[i]]);
+            seen = steps[i].vfill;
+        }
+    }
+    if (expr && expr[0]) {
+        long want = 0;
+        int sroot;
+        venn_expr_ok++;
+        for (m = 0; m < (1 << k); m++) if ((tt_root >> m) & 1) want += R[m];
+        CHECK(res.num == want, "%s: n(%s) = %ld, wanted %ld", tag, expr, res.num, want);
+        CHECK(steps[nsteps - 1].fin, "%s: last step is not final", tag);
+        CHECK(steps[nsteps - 1].vfill == (k == 2 ? 0x0F : 0xFF), "%s: diagram not full at the end", tag);
+        /* the lit regions are exactly the truth table */
+        { uint8_t tt = 0; for (m = 0; m < (1 << k); m++) if ((tt_root >> m) & 1) tt = (uint8_t)(tt | (1 << m));
+          CHECK(steps[nsteps - 1].vhl == tt, "%s: lit regions %02x, wanted %02x", tag, steps[nsteps - 1].vhl, tt); }
+        CHECK(last_number(steps[nsteps - 1].state) == want, "%s: final line '%s' vs %ld", tag, steps[nsteps - 1].state, want);
+        /* the canonical text in the final step (spaces and all) reads back as the same set */
+        {
+            char canon[200], plain[200], *e;
+            const char *t = strstr(steps[nsteps - 1].text, "n(");
+            if (t) {
+                int depth = 0, np = 0;
+                clean_nb(t + 2, canon);
+                for (e = canon; *e; e++) { if (*e == '(') depth++; else if (*e == ')') { if (depth == 0) break; depth--; } }
+                *e = 0;
+                for (e = canon; *e; e++) if (*e != ' ') plain[np++] = *e;
+                plain[np] = 0;
+                sroot = se_parse(plain);
+                CHECK(sroot >= 0 && se_eval(sroot) == (uint8_t)tt_root, "%s: canonical text '%s' does not read back", tag, canon);
+            }
+        }
+        for (i = 0; i < nsteps; i++) { (void)i; }
+        want_steps = nfill + 1;
+        CHECK(nsteps >= want_steps, "%s: %d steps", tag, nsteps);
+    } else {
+        CHECK(nsteps == nfill + 1 && steps[nsteps - 1].fin, "%s: %d steps without an expression", tag, nsteps);
+    }
+    venn_check_layout(tag);
+    if (logf_) {
+        fprintf(logf_, "=== VENN %d sets  %s  find %s\n", k, vsum, expr && expr[0] ? expr : "(nothing)");
+        for (i = 0; i < nsteps; i++) {
+            char t[300], s2[300];
+            clean_nb(steps[i].text, t);
+            clean_nb(steps[i].state, s2);
+            fprintf(logf_, "  %s %d [fill %02x lit %02x]: %s\n         -> %s\n", steps[i].fin ? "FINAL" : "step ", i + 1, steps[i].vfill, steps[i].vhl, t, s2);
+        }
+    }
+}
+
+/* the numbers are given (typed), the game must refuse and say so */
+static void venn_bad(int k, const long *f, const char *tag, const char *needle)
+{
+    int i;
+    vn_k = (uint8_t)k;
+    for (i = 0; i < VF_N; i++) vn_f[i] = f[i];
+    vn_expr[0] = 0;
+    venn_make_summary();
+    CHECK(!solve_venn(), "%s: accepted inconsistent numbers", tag);
+    CHECK(vn_head != 0 && vn_msg[0] != 0, "%s: no message", tag);
+    if (needle) CHECK(strstr(vn_msg, needle) != 0, "%s: message '%s' lacks '%s'", tag, vn_msg, needle);
+    CHECK(strstr(vn_msg, "= -") == 0, "%s: the message shows a negative count: %s", tag, vn_msg);
+    venn_incons++;
+    if (logf_) fprintf(logf_, "=== VENN %d sets INCONSISTENT %s\n   %s\n   %s\n", k, vsum, vn_head, vn_msg);
+}
+
+/* does a typed set of numbers describe real regions? (independent of the game) */
+static int ref_consistent(int k, const long *f)
+{
+    long U = f[VF_U], A = f[VF_A], B = f[VF_B], C = f[VF_C], AB = f[VF_AB], AC = f[VF_AC], BC = f[VF_BC], ABC = f[VF_ABC], none = f[VF_NONE];
+    long r[8], sum = 0;
+    int m;
+    if (k == 2) {
+        r[3] = AB; r[1] = A - AB; r[2] = B - AB;
+        sum = r[1] + r[2] + r[3];
+    } else {
+        r[7] = ABC; r[3] = AB - ABC; r[5] = AC - ABC; r[6] = BC - ABC;
+        r[1] = A - r[3] - r[5] - r[7]; r[2] = B - r[3] - r[6] - r[7]; r[4] = C - r[5] - r[6] - r[7];
+        for (m = 1; m < 8; m++) sum += r[m];
+    }
+    for (m = 1; m < (1 << k); m++) if (r[m] < 0) return 0;
+    if (U - sum < 0) return 0;
+    if (none >= 0 && none != U - sum) return 0;
+    return 1;
+}
+
+static void run_venn_tests(long N)
+{
+    long i;
+    char tag[80];
+    /* hand-checked problems (the numbers in the comments were worked out by hand) */
+    {
+        /* 20 students, 12 like A, 9 like B, 5 both: A only 7, both 5, B only 4, neither 4 */
+        long R[8] = { 4, 7, 4, 5 };
+        venn_case(2, R, 0, 0, 0, "hand2a");
+        venn_case(2, R, 1, "AuB", 0x0E, "hand2b");           /* n(A u B) = 7+5+4 = 16 */
+        venn_case(2, R, 0, "n(AuB)'", 0x01, "hand2c");       /* 4 */
+        venn_case(2, R, 0, "A'", 0x05, "hand2d");            /* 4 + 4 = 8 */
+        venn_case(2, R, 0, "AnB'", 0x02, "hand2e");          /* 7 */
+        venn_case(2, R, 0, "(AnB)'", 0x07, "hand2f");        /* 20 - 5 = 15 */
+        CHECK(res.num == 15, "hand2f: n((A n B)') = %ld", res.num);
+        venn_case(2, R, 0, "A'uB'", 0x07, "hand2g");         /* De Morgan: (A n B)' */
+        { long R2[8] = { 0, 3, 0, 0 };  venn_case(2, R2, 1, "A", 0x0A, "hand2h"); }    /* a single set */
+        { long R2[8] = { 0, 0, 0, 8 };  venn_case(2, R2, 0, "AnB", 0x08, "hand2i"); }  /* A = B */
+        { long R2[8] = { 9, 0, 0, 0 };  venn_case(2, R2, 1, "AuB", 0x0E, "hand2j"); }  /* sets that are empty */
+        { long R2[8] = { 1, 20, 14, 0 }; venn_case(2, R2, 0, "n(AnB)", 0x08, "hand2k"); }   /* no overlap */
+    }
+    {
+        /* U 50, A 20, B 18, C 15, AB 8, AC 7, BC 6, ABC 3: middle 3, AB only 5, AC only 4, BC only 3,
+           A only 20-5-4-3 = 8, B only 18-5-3-3 = 7, C only 15-4-3-3 = 5, outside 50-35 = 15 */
+        long R[8] = { 15, 8, 7, 5, 5, 4, 3, 3 };
+        venn_case(3, R, 0, 0, 0, "hand3a");
+        CHECK(vr[0] == 15 && vr[7] == 3 && vr[1] == 8 && vr[2] == 7 && vr[4] == 5, "hand3a: regions");
+        venn_case(3, R, 1, "AuBuC", 0xFE, "hand3b");                          /* 35 */
+        CHECK(res.num == 35, "hand3b: %ld", res.num);
+        venn_case(3, R, 0, "n(BnC)'", 0xFF & ~((1 << 6) | (1 << 7)), "hand3c"); /* 50 - 6 = 44 */
+        CHECK(res.num == 44, "hand3c: %ld", res.num);
+        venn_case(3, R, 0, "n(AuB)'nC", 0x10, "hand3d");                     /* only C: 5 */
+        CHECK(res.num == 5, "hand3d: %ld", res.num);
+        /* n((A n B) u C): regions 3,7 and 4,5,6,7 = 5+3+5+4+3 = 20 */
+        venn_case(3, R, 0, "n((AnB)uC)", (1 << 3) | (1 << 7) | (1 << 4) | (1 << 5) | (1 << 6), "hand3e");
+        CHECK(res.num == 20, "hand3e: %ld", res.num);
+        venn_case(3, R, 0, "(AuB)'uC'", 0x1F, "hand3f");                /* masks 0,1,2,3,4 = 15+8+7+5+5 = 40 */
+        CHECK(res.num == 40, "hand3f: %ld", res.num);
+        venn_case(3, R, 0, "AnBnC", 0x80, "hand3g");                          /* 3 */
+        venn_case(3, R, 0, "AnB'nC'", 0x02, "hand3h");                        /* A only 8 */
+        venn_case(3, R, 0, "n(AuB)", 0xEE, "hand3i");                          /* masks 1,2,3,5,6,7 = 8+7+5+4+3+3 = 30 */
+        CHECK(res.num == 30, "hand3i: %ld", res.num);
+    }
+    /* inconsistent numbers */
+    {
+        long f[VF_N];
+        int j;
+        for (j = 0; j < VF_N; j++) f[j] = -1;
+        f[VF_U] = 20; f[VF_A] = 12; f[VF_B] = 9; f[VF_AB] = 10;                    /* overlap bigger than B */
+        venn_bad(2, f, "bad2a", "cannot be bigger");
+        f[VF_U] = 15; f[VF_A] = 12; f[VF_B] = 9; f[VF_AB] = 5;                     /* the circles hold 16 but U is 15 */
+        venn_bad(2, f, "bad2b", "n(U) must be at least 16");
+        f[VF_U] = 20; f[VF_NONE] = 5;                                              /* outside is really 4 */
+        f[VF_U] = 20; f[VF_A] = 12; f[VF_B] = 9; f[VF_AB] = 5; f[VF_NONE] = 5;
+        venn_bad(2, f, "bad2c", "do not add up");
+        for (j = 0; j < VF_N; j++) f[j] = -1;
+        f[VF_U] = 50; f[VF_A] = 20; f[VF_B] = 18; f[VF_C] = 15; f[VF_AB] = 2; f[VF_AC] = 7; f[VF_BC] = 6; f[VF_ABC] = 3;   /* AB < ABC */
+        venn_bad(3, f, "bad3a", "hold the middle");
+        f[VF_AB] = 8; f[VF_A] = 10;                                                  /* A too small for its overlaps */
+        venn_bad(3, f, "bad3b", "too small");
+        f[VF_A] = 20; f[VF_U] = 30;                                                  /* U smaller than the circles */
+        venn_bad(3, f, "bad3c", "n(U) must be at least");
+        f[VF_U] = 50; f[VF_NONE] = 14;                                               /* outside should be 15 */
+        venn_bad(3, f, "bad3d", "do not add up");
+        f[VF_NONE] = -1; f[VF_B] = -1;                                                /* a blank */
+        venn_bad(3, f, "bad3e", "Please fill in n(B)");
+    }
+    /* many random problems, with random expressions that carry their own truth tables */
+    for (i = 0; i < N; i++) {
+        int k = (i & 1) ? 3 : 2, m, with_none = (int)(rr() & 1), nested = 0;
+        long R[8];
+        char expr[120];
+        int g, tt = 0;
+        memset(R, 0, sizeof R);
+        for (m = 0; m < (1 << k); m++) R[m] = (rr() % 4 == 0) ? 0 : (long)(rr() % 60);
+        if (rr() % 8) {
+            ngx = 0;
+            g = gx_rand(1 + (int)(rr() % 3), k);
+            gx_print(expr, g, 0);
+            for (m = 0; m < (1 << k); m++) if (gx_truth(g, m)) tt |= 1 << m;
+            nested = (gx[g].t != 0 && ((gx[gx[g].l].t > 0) || (gx[g].r >= 0 && gx[gx[g].r].t > 0)));
+            if (strlen(expr) > MAXIN) { expr[0] = 0; tt = 0; nested = 0; }
+        } else {
+            expr[0] = 0;
+        }
+        if (nested) venn_nested++;
+        sprintf(tag, "random%ld", i);
+        if (expr[0] && (rr() & 1)) {                    /* sometimes wrapped as n( ... ) */
+            char w[160];
+            if (strlen(expr) + 3 <= MAXIN) { sprintf(w, "n(%s)", expr); strcpy(expr, w); }
+        }
+        venn_case(k, R, with_none, expr, tt, tag);
+        /* now perturb one typed number: the game must agree with the independent consistency check */
+        {
+            long f[VF_N];
+            int j, pick;
+            venn_fields(k, R, with_none);
+            for (j = 0; j < VF_N; j++) f[j] = vn_f[j];
+            pick = (int)(rr() % VF_N);
+            if (f[pick] >= 0) {
+                f[pick] += (long)(rr() % 7) - 3;
+                if (f[pick] < 0) f[pick] = 0;
+                vn_k = (uint8_t)k;
+                for (j = 0; j < VF_N; j++) vn_f[j] = f[j];
+                vn_expr[0] = 0;
+                venn_make_summary();
+                if (ref_consistent(k, f)) {
+                    CHECK(solve_venn(), "%s: perturbed but consistent numbers refused: %s", tag, vn_msg);
+                } else {
+                    CHECK(!solve_venn(), "%s: inconsistent numbers accepted: %s", tag, vsum);
+                    if (vn_msg[0]) CHECK(vn_head != 0, "%s: message without heading", tag);
+                    venn_incons++;
+                }
+            }
+        }
+    }
+    /* expression mistakes: refused with a position */
+    {
+        static const char *const badx[] = { "A u", "(AuB", "AuB)", "AxB", "D", "n(", "AnuB", "u A", "A''' n", "n()", "((((((((((A))))))))))", "AuBuC", "C" };
+        size_t b;
+        long R[8] = { 4, 7, 4, 5 };
+        for (b = 0; b < sizeof badx / sizeof badx[0]; b++) {
+            vn_k = 2;
+            venn_fields(2, R, 0);
+            strncpy(vn_expr, badx[b], MAXIN);
+            vn_expr[MAXIN] = 0;
+            venn_make_summary();
+            if (solve_venn()) {
+                /* a few of these are valid; the rest must say why */
+                FAIL("expression '%s' was accepted", badx[b]);
+            } else {
+                CHECK(vn_head != 0 && vn_msg[0] && vn_at >= 0 && vn_at <= (int)strlen(badx[b]), "'%s': message %s at %d", badx[b], vn_msg, vn_at);
+                if (logf_) fprintf(logf_, "=== VENN expression '%s' refused: %s (at %d)\n", badx[b], vn_msg, vn_at);
+            }
+        }
+    }
+    printf("venn: %ld 2-set and %ld 3-set problems solved and checked, %ld inconsistent number sets refused, %ld expressions (%ld nested)\n",
+           venn_checks_2, venn_checks_3, venn_incons, venn_expr_ok, venn_nested);
+    printf("  longest Venn step text: %d lines (limit 3), longest calculation: %d lines of 13 columns (limit 10)\n", venn_max_text, venn_max_state);
+}
+
+/* random Venn numbers (blank, huge, inconsistent) and random set-expression strings: never a crash,
+   a negative count or a wrong answer */
+static void run_venn_garbage(long N)
+{
+    static const char alpha[] = "ABCABCunun\x27\x27\x27()()xDn ";
+    long i, ok = 0, refused = 0;
+    for (i = 0; i < N; i++) {
+        int k = (rr() & 1) ? 3 : 2, j, len = (int)rnd_range(0, 30);
+        long t0 = trunc_n;
+        vn_k = (uint8_t)k;
+        for (j = 0; j < VF_N; j++) {
+            unsigned c = rr() % 10;
+            vn_f[j] = c == 0 ? -1 : c == 1 ? (long)(rr() % 1500) : (long)(rr() % 120);
+        }
+        for (j = 0; j < len; j++) vn_expr[j] = alpha[rr() % (sizeof alpha - 1)];
+        vn_expr[len] = 0;
+        if (rr() % 3 == 0) vn_expr[0] = 0;
+        venn_make_summary();
+        if (solve_venn()) {
+            int m;
+            long tot = 0;
+            ok++;
+            CHECK(nsteps >= 1 && steps[nsteps - 1].fin, "venn garbage: no final step");
+            venn_check_layout("garbage");
+            for (m = 0; m < (1 << k); m++) { CHECK(vr[m] >= 0, "negative region"); tot += vr[m]; }
+            CHECK(tot == vn_f[VF_U], "regions add up to %ld, not n(U) = %ld", tot, vn_f[VF_U]);
+        } else {
+            refused++;
+            CHECK(vn_head != 0, "venn garbage: refusal without a heading");
+            CHECK(strstr(vn_msg, "= -") == 0, "venn garbage: negative count in the message: %s", vn_msg);
+            CHECK(vn_at < 0 || vn_at <= (int)strlen(vn_expr), "venn garbage: error position %d", vn_at);
+        }
+        CHECK(trunc_n == t0, "venn garbage: truncated string");
+    }
+    printf("venn garbage: %ld random problems: %ld solved, %ld refused with a message\n", N, ok, refused);
+}
+
+/* ---------------------------------------------------------------- */
+/* square roots typed in: the quadratic formula                     */
+/* ---------------------------------------------------------------- */
+static long rad_n;
+
+static double rad_value(const root_t *r)
+{
+    return ((double)r->u + (double)r->w * sqrt((double)r->m)) / (double)r->den;
+}
+
+static void rad_case(const char *in, int expect_ok, const char *tag)
+{
+    cls_t cl;
+    int i, ok;
+    double want;
+    long t0 = trunc_n;
+    int all = 0;
+    qp = in;
+    want = q_expr();
+    q_sp();
+    ok = classify(in, &cl);
+    CHECK(ok && cl.type == PT_RADICAL, "%s: '%s' classified as %d (%s)", tag, in, cl.type, cl.why ? cl.why : "");
+    if (!ok) return;
+    if (!generate(in, PT_RADICAL)) {
+        CHECK(!expect_ok, "%s: '%s' refused: %s", tag, in, g_fail ? g_fail : "?");
+        CHECK(g_fail != 0, "%s: refusal without a reason", tag);
+        if (logf_) fprintf(logf_, "=== %s  REFUSED: %s\n", in, g_fail ? g_fail : "?");
+        return;
+    }
+    CHECK(expect_ok, "%s: '%s' accepted but a refusal was expected", tag, in);
+    rad_n++;
+    check_layout(in);
+    CHECK(trunc_n == t0, "%s: truncated", in);
+    {
+        double got = rad_value(&res.root[0]);
+        CHECK(fabs(got - want) <= 1e-7 * (1 + fabs(want)), "%s: '%s' = %.9g, wanted %.9g", tag, in, got, want);
+        CHECK(res.root[0].den > 0 && gcdll(gcdll(res.root[0].u, res.root[0].w), res.root[0].den) == 1, "%s: value not in lowest terms", in);
+    }
+    /* every step's expression still equals the original */
+    for (i = 0; i < nsteps; i++) {
+        char buf[300];
+        const char *p;
+        double v;
+        if (steps[i].eqv != EQ_EXPR && !steps[i].fin) continue;
+        clean_nb(steps[i].state, buf);
+        p = buf;
+        if (p[0] == '=' && p[1] == ' ') p += 2;
+        {
+            char *par = strstr((char *)p, "   (about");
+            if (par) *par = 0;
+        }
+        v = q_eval(p, &all);
+        CHECK(all && fabs(v - want) <= 1e-7 * (1 + fabs(want)), "%s: step %d '%s' = %.9g, wanted %.9g", in, i + 1, buf, v, want);
+    }
+    if (logf_) print_steps(in, "square roots");
+}
+
+static void run_radical_tests(long N)
+{
+    static const char *const good[] = {
+        "sqrt(25)", "sqrt(16)+3", "sqrt(48)", "2sqrt(3)*3", "sqrt(2)*sqrt(2)", "sqrt(2)+sqrt(2)", "3sqrt(5)-sqrt(5)", "(4+2sqrt(3))/2", "(-3+sqrt(17))/4",
+        "(-5+sqrt(5^2-4*1*6))/(2*1)", "(-5-sqrt(5^2-4*1*6))/(2*1)", "(-1+sqrt(1-4*1*(-1)))/(2*1)", "(3+sqrt(9-4*2*1))/(2*2)", "1/sqrt(2)", "(1+sqrt(5))/2",
+        "sqrt(1)", "sqrt(0)", "2*(3+sqrt(4))", "sqrt(3^2+4^2)", "-sqrt(9)", "10/sqrt(5)", "(2+sqrt(8))/2", "sqrt(2)*3sqrt(2)", "(-(-4)+sqrt(16-4*1*3))/2",
+        "sqrt(12)/sqrt(3)", "5-sqrt(16)", "sqrt(50)-sqrt(2)", "(sqrt(3)+1)(sqrt(3)-1)", "sqrt(7)^2", "(1+sqrt(2))^2", "sqrt(9999)", "sqrt(100)+sqrt(81)", "(6+sqrt(36-4*3*(-2)))/(2*3)"
+    };
+    static const char *const bad[] = {
+        "sqrt(-4)", "sqrt(2)+sqrt(3)", "sqrt(1/2)", "sqrt(sqrt(2))", "(1+sqrt(3))/(1-sqrt(1))", "1/(sqrt(4)-2)", "sqrt(2)*sqrt(3)", "5/(3-3)+sqrt(4)",
+        "9999*9999*9999*sqrt(4)", "sqrt(9999)^12"
+    };
+    size_t g;
+    long i;
+    for (g = 0; g < sizeof good / sizeof good[0]; g++) rad_case(good[g], 1, "good");
+    for (g = 0; g < sizeof bad / sizeof bad[0]; g++) rad_case(bad[g], 0, "bad");
+    /* the quadratic formula with random a, b, c typed the way a student would */
+    for (i = 0; i < N; i++) {
+        long a = rnd_range(1, 9), b = rnd_range(-30, 30), c = rnd_range(-30, 30), D;
+        char in[200], A[16], B[16], C[16];
+        int sign = (int)(rr() & 1);
+        if (rr() & 1) a = -a;
+        D = b * b - 4 * a * c;
+        sprintf(A, a < 0 ? "(%ld)" : "%ld", a);
+        sprintf(B, b < 0 ? "(%ld)" : "%ld", b);
+        sprintf(C, c < 0 ? "(%ld)" : "%ld", c);
+        sprintf(in, "(%s%ssqrt(%s^2-4*%s*%s))/(2*%s)", b == 0 ? "0" : (b < 0 ? "-(" : "-"), sign ? "+" : "-", B, A, C, A);
+        if (b < 0) sprintf(in, "(-(%ld)%ssqrt(%s^2-4*%s*%s))/(2*%s)", b, sign ? "+" : "-", B, A, C, A);
+        else if (b > 0) sprintf(in, "(-%ld%ssqrt(%s^2-4*%s*%s))/(2*%s)", b, sign ? "+" : "-", B, A, C, A);
+        else sprintf(in, "(0%ssqrt(%s^2-4*%s*%s))/(2*%s)", sign ? "+" : "-", B, A, C, A);
+        rad_case(in, D >= 0, "formula");
+    }
+    printf("radical: %ld expressions with sqrt( solved and checked against an independent evaluator\n", rad_n);
+}
+
+/* sqrt( inside an equation (only perfect squares) */
+static void run_sqrt_equations(void)
+{
+    cls_t cl;
+    CHECK(classify("x^2+sqrt(25)x+6=0", &cl) && cl.type == PT_QUAD, "sqrt in a quadratic");
+    CHECK(generate("x^2+sqrt(25)x+6=0", PT_QUAD) && res.nroots == 2 && res.root[0].u == -3 && res.root[1].u == -2, "x^2+5x+6=0 roots");
+    CHECK(classify("2x+sqrt(16)=sqrt(100)", &cl) && cl.type == PT_LINEAR, "sqrt in a linear equation");
+    CHECK(generate("2x+sqrt(16)=sqrt(100)", PT_LINEAR) && res.kind == RK_ONE && res.num == 3 && res.den == 1, "2x+4=10");
+    CHECK(!classify("x^2=sqrt(17)", &cl) && cl.why && strstr(cl.why, "perfect"), "non perfect square with x: %s", cl.why ? cl.why : "?");
+    CHECK(!classify("sqrt(x)+1", &cl) && cl.why, "sqrt of x refused");
+    CHECK(!classify("x+sqrt(-4)=0", &cl) && cl.why, "negative root with x refused");
+    CHECK(classify("3sqrt(4)x+2", &cl) && cl.type == PT_SIMPLIFY, "implicit multiplication with sqrt");
+    {
+        char c[100];
+        int ok = generate("3sqrt(4)x+2", PT_SIMPLIFY);
+        clean_nb(steps[nsteps - 1].state, c);
+        CHECK(ok && strcmp(c, "6x + 2") == 0, "3sqrt(4)x+2 -> 6x + 2 (%s)", c);
+    }
+    CHECK(!classify("sqrt(4", &cl) && cl.at >= 0, "missing bracket after sqrt(");
+    CHECK(!classify("sqr(4)", &cl) && cl.at >= 0, "misspelt sqrt");
+    printf("sqrt in equations: checked\n");
+}
+
+/* ---------------------------------------------------------------- */
+/* DEL: the panic key                                               */
+/* ---------------------------------------------------------------- */
+static uint8_t ph_kg[64], ph_km[64];
+static long ph_subsets, ph_phantoms, ph_bad;
+static void ph_check(const int *idx, int cnt)
+{
+    uint8_t kb[8];
+    int c;
+    memset(kb, 0, 8);
+    for (c = 0; c < cnt; c++) kb[ph_kg[idx[c]]] |= ph_km[idx[c]];
+    ph_subsets++;
+    stub_ghost(kb);
+    memset(keys, 0, sizeof keys);
+    for (c = 1; c < 8; c++) keys[c] = kb[c];
+    if (kb[1] & kb_Del) {
+        ph_phantoms++;
+        if (del_hit()) { ph_bad++; if (ph_bad < 5) printf("PHANTOM DEL accepted: %02x %02x %02x %02x %02x %02x %02x\n", kb[1], kb[2], kb[3], kb[4], kb[5], kb[6], kb[7]); }
+    }
+}
+
+static void run_phantom_test(void)
+{
+    /* every real key of the keypad (see the table in keypadc.h), except DEL itself */
+    static const uint8_t cnt[8] = { 0, 8, 7, 8, 8, 7, 7, 4 };
+    static const uint8_t start[8] = { 0, 0, 1, 0, 0, 0, 0, 0 };
+    int n = 0, g, b, i, j, k, l, idx[4];
+    long alone_ok = 0;
+    for (g = 1; g < 8; g++) for (b = start[g]; b < start[g] + cnt[g]; b++) {
+        if (g == 1 && b == 7) continue;
+        ph_kg[n] = (uint8_t)g;
+        ph_km[n] = (uint8_t)(1 << b);
+        n++;
+    }
+    /* all sets of 1 to 4 keys other than DEL: a ghosted DEL must never be accepted */
+    for (i = 0; i < n; i++) {
+        idx[0] = i; ph_check(idx, 1);
+        for (j = i + 1; j < n; j++) {
+            idx[1] = j; ph_check(idx, 2);
+            for (k = j + 1; k < n; k++) {
+                idx[2] = k; ph_check(idx, 3);
+                for (l = k + 1; l < n; l++) { idx[3] = l; ph_check(idx, 4); }
+            }
+        }
+    }
+    CHECK(ph_bad == 0, "%ld phantom DEL presses were accepted", ph_bad);
+    /* a real DEL alone, or with one other key, always works (even through ghosting) */
+    for (i = -1; i < n; i++) {
+        uint8_t kb[8];
+        memset(kb, 0, 8);
+        kb[1] |= kb_Del;
+        if (i >= 0) kb[ph_kg[i]] |= ph_km[i];
+        stub_ghost(kb);
+        memset(keys, 0, sizeof keys);
+        for (g = 1; g < 8; g++) keys[g] = kb[g];
+        CHECK(del_hit(), "a real DEL with %s was not accepted", i < 0 ? "no other key" : "one other key");
+        alone_ok++;
+    }
+    printf("DEL: %ld key combinations (1 to 4 keys) through the ghosting model: %ld read as DEL without DEL being pressed, %ld of them accepted; a real DEL alone or with 1 other key worked in %ld of %d cases\n",
+           ph_subsets, ph_phantoms, ph_bad, alone_ok, n + 1);
+}
+
+/* ---------------------------------------------------------------- */
 /* fake keypad                                                      */
 /* ---------------------------------------------------------------- */
-typedef struct { uint8_t g, m; int shot; } tap_t;
+typedef struct { uint8_t g, m; int shot; void (*fn)(void); } tap_t;
 static tap_t q[8192];
 static int qh, qt, tap_release;
-static void tap(uint8_t g, uint8_t m) { q[qt & 8191].g = g; q[qt & 8191].m = m; q[qt & 8191].shot = -1; qt++; }
+static void tap(uint8_t g, uint8_t m) { q[qt & 8191].g = g; q[qt & 8191].m = m; q[qt & 8191].shot = -1; q[qt & 8191].fn = 0; qt++; }
+/* run f when the game reaches this point of the script (between two keys) */
+static void act(void (*f)(void)) { q[qt & 8191].g = 0; q[qt & 8191].m = 0; q[qt & 8191].shot = -1; q[qt & 8191].fn = f; qt++; }
+static long watch_limit;
+static int fuzz_mode, fuzz_left, del_intended;
+static long fuzz_frames;
 static const char *shot_names[1024];
 static int nshots;
 static const char *shot_dir;
 static void shot(const char *name)
 {
-    q[qt & 8191].g = 0; q[qt & 8191].m = 0; q[qt & 8191].shot = nshots;
+    q[qt & 8191].g = 0; q[qt & 8191].m = 0; q[qt & 8191].fn = 0; q[qt & 8191].shot = nshots;
     shot_names[nshots++] = name;
     qt++;
 }
@@ -1070,8 +1669,332 @@ static void typestr(const char *s)
     }
 }
 
-static int fuzz_mode, fuzz_left;
-static long fuzz_frames;
+/* ---------------------------------------------------------------- */
+/* UI scripts: typing sqrt(, the 2nd indicator, Venn forms, DEL      */
+/* ---------------------------------------------------------------- */
+/* types a string the way a student would: sqrt( is 2nd then the x^2 key, set letters use their keys */
+static void typeall(const char *s)
+{
+    while (*s) {
+        int i, found = 0;
+        if (!strncmp(s, "sqrt(", 5)) { tap(1, kb_2nd); tap(2, kb_Square); s += 5; continue; }
+        if (*s == '^') { tap(6, kb_Power); s++; continue; }
+        for (i = 0; i < NKM && !found; i++)
+            if (KM[i].s[0] == *s && KM[i].s[1] == 0 && !(KM[i].g == 5 && KM[i].m == kb_Chs)) { tap(KM[i].g, KM[i].m); found = 1; }
+        for (i = 0; i < NVK && !found; i++)
+            if (VK[i].s[0] == *s) { tap(VK[i].g, VK[i].m); found = 1; }
+        s++;
+    }
+}
+
+static void to_title_top(void)
+{
+    int i;
+    for (i = 0; i < 7; i++) tap(7, kb_Up);
+}
+
+static void pick_title(int item)
+{
+    int i;
+    to_title_top();
+    for (i = 0; i < item; i++) tap(7, kb_Down);
+    tap(6, kb_Enter);
+    idle(2);
+}
+
+/* the numbers of a Venn form, one per field (an empty one stays blank), then the expression */
+static void venn_type(const char *nums, const char *expr)
+{
+    const char *p = nums;
+    for (;;) {
+        const char *e = strchr(p, ',');
+        size_t n = e ? (size_t)(e - p) : strlen(p), i;
+        for (i = 0; i < n; i++) typeall((char[]){ p[i], 0 });
+        tap(6, kb_Enter);
+        if (!e) break;
+        p = e + 1;
+    }
+    if (expr && expr[0]) typeall(expr);
+}
+
+/* how many steps the game will make for these typed numbers (used to know how often to press ENTER) */
+static int venn_count(int k, const char *nums, const char *expr)
+{
+    static const uint8_t r2[5] = { VF_U, VF_A, VF_B, VF_AB, VF_NONE };
+    static const uint8_t r3[9] = { VF_U, VF_A, VF_B, VF_C, VF_AB, VF_AC, VF_BC, VF_ABC, VF_NONE };
+    const uint8_t *rows = k == 2 ? r2 : r3;
+    int i = 0;
+    const char *p = nums;
+    memset(vn_f, -1, sizeof vn_f);
+    for (;;) {
+        const char *e = strchr(p, ',');
+        size_t n = e ? (size_t)(e - p) : strlen(p);
+        if (n > 0) vn_f[rows[i]] = atol(p);
+        i++;
+        if (!e) break;
+        p = e + 1;
+    }
+    vn_k = (uint8_t)k;
+    strncpy(vn_expr, expr, MAXIN);
+    vn_expr[MAXIN] = 0;
+    venn_make_summary();
+    return solve_venn() ? nsteps : 0;
+}
+
+static void act_second_on(void) { CHECK(second, "the 2nd indicator is not lit after pressing 2nd"); }
+static void act_second_off(void) { CHECK(!second, "the 2nd indicator is still lit after the next key"); }
+static void act_prob_is_sqrt(void) { CHECK(strcmp(prob, "sqrt(") == 0, "2nd then x^2 typed '%s' instead of sqrt(", prob); }
+static void act_prob_is_sq(void) { CHECK(strcmp(prob, "sqrt(^2") == 0, "x^2 without 2nd typed '%s' (after sqrt( )", prob); }
+static void act_prob_empty(void) { CHECK(prob[0] == 0, "prob is '%s'", prob); }
+
+static void run_second_key_test(void)
+{
+    /* 2nd lights up, x^2 then types sqrt(, the indicator goes off; x^2 alone types ^2;
+       2nd twice cancels; any other key switches it off without typing anything special */
+    to_title_top();
+    tap(6, kb_Enter);
+    idle(3);
+    act(act_prob_empty);
+    tap(1, kb_2nd); idle(2);
+    act(act_second_on);
+    tap(2, kb_Square); idle(2);
+    act(act_second_off);
+    act(act_prob_is_sqrt);
+    tap(2, kb_Square); idle(2);
+    act(act_prob_is_sq);
+    tap(1, kb_2nd); idle(2); act(act_second_on);
+    tap(1, kb_2nd); idle(2); act(act_second_off);              /* pressed twice: off again */
+    tap(1, kb_2nd); idle(2); act(act_second_on);
+    tap(7, kb_Left); idle(2); act(act_second_off);             /* some other key: off, nothing typed */
+    tap(1, kb_Mode); idle(2); act(act_prob_empty);              /* MODE clears the line */
+    tap(6, kb_Clear); idle(2);                                  /* CLEAR on an empty line: back to the menu */
+    tap(6, kb_Clear);                                           /* CLEAR on the title: quit */
+    game_main();
+}
+
+static const char *e2e_prob;
+static void act_expect_prob(void) { CHECK(strcmp(prob, e2e_prob) == 0, "typed '%s', the line shows '%s'", e2e_prob, prob); }
+
+/* a problem typed with the real keys, solved, stepped through to the end */
+static void ui_solve(const char *typed, int steps_to_press)
+{
+    int i;
+    e2e_prob = typed;
+    pick_title(0);
+    typeall(typed);
+    idle(2);
+    act(act_expect_prob);
+    tap(6, kb_Enter);
+    idle(3);
+    for (i = 0; i < steps_to_press; i++) { tap(6, kb_Enter); idle(1); }
+    idle(2);
+}
+
+static void run_sqrt_ui_test(void)
+{
+    /* the quadratic formula for x^2+5x+6=0, typed: root x = (-5 + 1)/2 = -2 */
+    const char *f = "(-5+sqrt(5^2-4*1*6))/(2*1)";
+    cls_t cl;
+    int n;
+    CHECK(classify(f, &cl) && cl.type == PT_RADICAL, "formula classified");
+    CHECK(generate(f, PT_RADICAL), "formula generate");
+    n = nsteps;
+    ui_solve(f, n - 1);                         /* press Enter on every step but the last */
+    tap(6, kb_Enter); idle(3);                  /* past the end: the "Done!" menu */
+    tap(7, kb_Down); tap(7, kb_Down); tap(6, kb_Enter); idle(3);   /* back to the main menu */
+    tap(6, kb_Clear);                           /* quit */
+    game_main();
+    CHECK(ptype == PT_RADICAL, "the problem was solved as type %d", ptype);
+    CHECK(res.nroots == 1 && res.root[0].u == -2 && res.root[0].w == 0 && res.root[0].den == 1, "formula root %ld/%ld", res.root[0].u, res.root[0].den);
+    CHECK(strcmp(steps[nsteps - 1].state, "= -2") == 0, "final line '%s'", steps[nsteps - 1].state);
+
+    /* an irrational root: x = (-3 + sqrt(17))/4 for 2x^2+3x-1=0, typed with the (-) key and brackets */
+    f = "(-3+sqrt(3^2-4*2*(-1)))/(2*2)";
+    CHECK(classify(f, &cl) && cl.type == PT_RADICAL, "formula 2 classified");
+    CHECK(generate(f, PT_RADICAL), "formula 2 generate");
+    n = nsteps;
+    {
+        /* with the (-) key for the minus sign in front of the 1 */
+        int i;
+        e2e_prob = f;
+        pick_title(0);
+        for (i = 0; f[i]; ) {
+            if (f[i] == '(' && f[i + 1] == '-' && f[i + 2] == '1') { tap(4, kb_LParen); tap(5, kb_Chs); tap(3, kb_1); i += 3; continue; }
+            if (!strncmp(f + i, "sqrt(", 5)) { tap(1, kb_2nd); tap(2, kb_Square); i += 5; continue; }
+            { char one[2] = { f[i], 0 }; typeall(one); }
+            i++;
+        }
+        idle(2);
+        act(act_expect_prob);
+        tap(6, kb_Enter); idle(3);
+        { int k; for (k = 0; k < n - 1; k++) { tap(6, kb_Enter); idle(1); } }
+        tap(6, kb_Enter); idle(3);
+        tap(7, kb_Down); tap(7, kb_Down); tap(6, kb_Enter); idle(3);
+        tap(6, kb_Clear);
+        game_main();
+    }
+    CHECK(res.root[0].u == -3 && res.root[0].w == 1 && res.root[0].m == 17 && res.root[0].den == 4, "irrational root (%ld + %ld sqrt(%ld))/%ld", res.root[0].u, res.root[0].w, res.root[0].m, res.root[0].den);
+    {
+        char c[300];
+        clean_nb(steps[nsteps - 1].state, c);
+        CHECK(strstr(c, "(-3 + sqrt(17))/4") != 0 && strstr(c, "about 0.28") != 0, "final line '%s'", c);
+    }
+
+    /* sqrt( in a quadratic equation typed with the keys: x^2+sqrt(25)x+6=0 */
+    ui_solve("x^2+sqrt(25)x+6=0", 0);
+    {
+        int k;
+        CHECK(classify("x^2+sqrt(25)x+6=0", &cl) && generate("x^2+sqrt(25)x+6=0", PT_QUAD), "quadratic with sqrt generate");
+        for (k = 0; k < nsteps; k++) { tap(6, kb_Enter); idle(1); }
+    }
+    tap(7, kb_Down); tap(7, kb_Down); tap(6, kb_Enter); idle(3);
+    tap(6, kb_Clear);
+    game_main();
+    CHECK(ptype == PT_QUAD && res.nroots == 2 && res.root[0].u == -3 && res.root[1].u == -2, "x^2+sqrt(25)x+6=0 solved through the UI");
+    printf("sqrt( typed with 2nd + x^2 and solved through the UI: quadratic formula expressions and an equation: checked\n");
+}
+
+/* the Venn form, driven with keys, to the final step */
+static void run_venn_ui_test(void)
+{
+    int n;
+    /* 2 sets: n(U)=20 n(A)=12 n(B)=9 n(A n B)=5 and the expression n(A u B) */
+    n = venn_count(2, "20,12,9,5,", "n(AuB)");
+    CHECK(n == 5, "2-set steps %d", n);
+    pick_title(1);
+    venn_type("20,12,9,5,", "n(AuB)");
+    tap(1, kb_Graph);                         /* GRAPH solves from anywhere in the form */
+    idle(4);
+    { int k; for (k = 0; k < n; k++) { tap(6, kb_Enter); idle(1); } }       /* every step, then the end menu */
+    tap(7, kb_Down); tap(7, kb_Down); tap(6, kb_Enter); idle(3);
+    tap(6, kb_Clear);
+    game_main();
+    CHECK(ptype == PT_VENN && vn_k == 2, "Venn 2 sets was not solved through the UI (type %d)", ptype);
+    CHECK(vr[0] == 4 && vr[1] == 7 && vr[2] == 4 && vr[3] == 5, "2-set regions %ld %ld %ld %ld", vr[0], vr[1], vr[2], vr[3]);
+    {
+        char c[300];
+        clean_nb(steps[nsteps - 1].state, c);
+        CHECK(strcmp(c, "n(A u B) = n(A) + n(B) - n(A n B) = 12 + 9 - 5 = 16") == 0, "2-set final line: %s", c);
+    }
+
+    /* 3 sets with a nested expression, then an inconsistent one that must give a message */
+    n = venn_count(3, "50,20,18,15,8,7,6,3,", "n(AuB)'nC");
+    CHECK(n >= 9, "3-set steps %d", n);
+    pick_title(2);
+    venn_type("50,20,18,15,8,7,6,3,", "n(AuB)'nC");
+    tap(6, kb_Enter);                          /* ENTER on the expression row solves too */
+    idle(4);
+    { int k; for (k = 0; k < n; k++) { tap(6, kb_Enter); idle(1); } }
+    tap(7, kb_Down); tap(7, kb_Down); tap(6, kb_Enter); idle(3);
+    tap(6, kb_Clear);
+    game_main();
+    CHECK(ptype == PT_VENN && vn_k == 3 && vr[0] == 15 && vr[7] == 3 && vr[4] == 5, "3-set regions through the UI");
+    CHECK(res.num == 5, "n(AuB)'nC = %ld, wanted 5", res.num);
+
+    pick_title(1);
+    venn_type("20,12,9,10,", "");               /* the overlap 10 is bigger than n(B) = 9 */
+    tap(1, kb_Graph); idle(4);                  /* the message screen */
+    tap(6, kb_Enter); idle(3);                  /* back to the form */
+    tap(1, kb_Mode); idle(2);                   /* MODE: back to the menu */
+    tap(6, kb_Clear);
+    game_main();
+    CHECK(vn_head != 0 && strstr(vn_msg, "cannot be bigger") != 0, "inconsistent numbers gave '%s'", vn_msg);
+    printf("Venn forms typed with the real keys and solved through the UI: 2 sets, 3 sets with a nested expression, an inconsistent problem: checked\n");
+}
+
+static long del_runs, del_fails;
+static long del_writes_at_quit;
+static int del_screen = -1, del_ptype = -1;
+static long del_quits_total;
+static int del_intended_hook(void) { int ok = !fuzz_mode || del_intended; del_intended = 0; return ok; }
+void test_del_quit(void)
+{
+    del_writes_at_quit = stub_writes;
+    del_screen = cur_present_screen;
+    del_ptype = ptype;
+    del_quits_total++;
+    if (!del_intended_hook()) { FAIL("the program quit on a DEL that was not pressed (a ghost key?)"); }
+}
+
+static void del_try(const char *name, void (*setup)(void), int want_screen, int want_ptype)
+{
+    long f0;
+    setup();
+    tap(1, kb_Del);
+    f0 = frames;
+    watch_limit = frames + 5000;
+    stub_gfx_ended = 0;
+    del_writes_at_quit = -1;
+    game_main();
+    watch_limit = 0;
+    del_runs++;
+    CHECK(stub_gfx_ended, "%s: DEL did not reach gfx_End()", name);
+    CHECK(qh == qt, "%s: DEL was not the last key consumed", name);
+    CHECK(del_writes_at_quit >= 0 && stub_writes == del_writes_at_quit, "%s: something was saved after DEL (%ld writes)", name, stub_writes - del_writes_at_quit);
+    CHECK(frames - f0 < 4000, "%s: took %ld frames", name, frames - f0);
+    CHECK(del_screen == want_screen, "%s: DEL was pressed on screen %d, wanted %d", name, del_screen, want_screen);
+    if (want_ptype >= 0) CHECK(del_ptype == want_ptype, "%s: problem type %d, wanted %d", name, del_ptype, want_ptype);
+    if (stub_gfx_ended == 0) del_fails++;
+    printf("  DEL on %-34s -> left at once, gfx_End() called\n", name);
+}
+
+static void p_title(void) { to_title_top(); idle(2); }
+static void p_help(void) { pick_title(4); idle(2); tap(7, kb_Right); idle(2); }
+static void p_input(void) { pick_title(0); idle(3); }
+static void p_input_typed(void) { pick_title(0); typeall("3x+sqrt("); tap(1, kb_2nd); idle(3); }
+static void p_message(void) { pick_title(0); typeall("x/2=1"); tap(6, kb_Enter); idle(3); }
+static void p_choose(void) { pick_title(0); typeall("x^3+2x"); tap(6, kb_Enter); idle(3); }
+static void p_steps_mid(void) { pick_title(0); typeall("3x+5=20"); tap(6, kb_Enter); idle(2); tap(6, kb_Enter); idle(2); }
+static void p_end(void)
+{
+    int i;
+    pick_title(0);
+    typeall("3x+5=20");
+    tap(6, kb_Enter);
+    idle(2);
+    CHECK(generate("3x+5=20", PT_LINEAR), "p_end generate");
+    for (i = 0; i < nsteps; i++) { tap(6, kb_Enter); idle(1); }
+    idle(3);
+}
+static void p_radical_steps(void) { pick_title(0); typeall("(-3+sqrt(17))/4"); tap(6, kb_Enter); idle(2); tap(6, kb_Enter); idle(2); }
+static void p_history(void) { pick_title(3); idle(3); }
+static void p_venn2_form(void) { pick_title(1); venn_type("20,12,9", 0); idle(2); }
+static void p_venn3_form(void) { pick_title(2); idle(2); tap(7, kb_Down); tap(7, kb_Down); typeall("12"); idle(2); }
+static void p_venn_steps(void) { pick_title(1); venn_type("20,12,9,5,", "n(AuB)'"); tap(1, kb_Graph); idle(3); tap(6, kb_Enter); idle(2); tap(6, kb_Enter); idle(2); }
+static void p_venn3_steps(void) { pick_title(2); venn_type("50,20,18,15,8,7,6,3,", "n((AnB)uC)"); tap(1, kb_Graph); idle(3); tap(6, kb_Enter); idle(2); }
+static void p_venn_msg(void) { pick_title(1); venn_type("20,12,9,10,", ""); tap(1, kb_Graph); idle(3); }
+static void p_venn_end(void)
+{
+    int i;
+    pick_title(1);
+    venn_type("20,12,9,5,", "AuB");
+    tap(1, kb_Graph);
+    idle(3);
+    for (i = venn_count(2, "20,12,9,5,", "AuB"); i > 0; i--) { tap(6, kb_Enter); idle(1); }
+    idle(3);
+}
+
+static void run_del_tests(void)
+{
+    del_try("the title screen", p_title, SC_TITLE, -1);
+    del_try("the help screen (page 2)", p_help, SC_HELP, -1);
+    del_try("an empty input line", p_input, SC_INPUT, -1);
+    del_try("the input line with 2nd lit", p_input_typed, SC_INPUT, -1);
+    del_try("the 'cannot solve' message", p_message, SC_ERROR, -1);
+    del_try("the simplify-or-derivative menu", p_choose, SC_CHOOSE, -1);
+    del_try("a linear problem, step 2", p_steps_mid, SC_STEPS, PT_LINEAR);
+    del_try("the end menu (Done!)", p_end, SC_END, PT_LINEAR);
+    del_try("a square-root problem, step 2", p_radical_steps, SC_STEPS, PT_RADICAL);
+    del_try("the history screen", p_history, SC_HIST, -1);
+    del_try("the Venn 2-set form", p_venn2_form, SC_VENN, -1);
+    del_try("the Venn 3-set form (field 3)", p_venn3_form, SC_VENN, -1);
+    del_try("Venn 2 sets, step 3 of the steps", p_venn_steps, SC_STEPS, PT_VENN);
+    del_try("Venn 3 sets, step 2 of the steps", p_venn3_steps, SC_STEPS, PT_VENN);
+    del_try("the Venn 'numbers don't fit' message", p_venn_msg, SC_ERROR, -1);
+    del_try("the Venn end menu (Done!)", p_venn_end, SC_END, PT_VENN);
+    printf("DEL: %ld screens tested, DEL left at once every time and never saved anything\n", del_runs);
+}
+
 
 static void write_ppm(const char *name)
 {
@@ -1097,15 +2020,18 @@ void stub_on_swap(void)
 {
     frames++;
     memset(&cost, 0, sizeof cost);
+    if (watch_limit && frames > watch_limit) { fprintf(stderr, "FAIL: the program did not quit (hang)\n"); exit(4); }
     if (frames > 40000000L) { fprintf(stderr, "ERROR: frame cap reached\n"); exit(3); }
 }
+
 
 void stub_feed_keys(uint8_t *kb)
 {
     memset(kb, 0, 8);
     if (tap_release) { tap_release = 0; return; }
-    if (qh != qt) {
+    while (qh != qt) {
         tap_t *t = &q[qh & 8191];
+        if (t->fn) { void (*f)(void) = t->fn; qh++; f(); continue; }
         if (t->shot >= 0 && shot_dir) write_ppm(shot_names[t->shot]);
         kb[t->g] |= t->m;
         qh++;
@@ -1113,17 +2039,40 @@ void stub_feed_keys(uint8_t *kb)
         return;
     }
     if (fuzz_mode) {
-        /* random key presses; now and then a whole problem is typed in */
-        static const uint8_t g[] = { 3, 3, 4, 5, 3, 4, 5, 3, 4, 5, 3, 6, 6, 6, 6, 6, 5, 6, 6, 1, 1, 1, 2, 7, 7, 7, 7, 1, 4, 5, 6 };
-        static const uint8_t m[] = { kb_0, kb_1, kb_2, kb_3, kb_4, kb_5, kb_6, kb_7, kb_8, kb_9, kb_GraphVar, kb_Add, kb_Sub, kb_Mul, kb_Div,
-                                     kb_Power, kb_Chs, kb_Enter, kb_Clear, kb_Yequ, kb_Del, kb_Graph, kb_Square, kb_Left, kb_Right, kb_Up,
-                                     kb_Down, kb_2nd, kb_LParen, kb_RParen, kb_Enter };
+        /* random key presses (every key the game uses, 2nd and the Venn letters included); now and then a whole
+           problem is typed in, and DEL is pressed on purpose (never by accident: ghosting is on) */
+        static const struct { uint8_t g, m; } K[] = {
+            { 3, kb_0 }, { 3, kb_1 }, { 4, kb_2 }, { 5, kb_3 }, { 3, kb_4 }, { 4, kb_5 }, { 5, kb_6 }, { 3, kb_7 }, { 4, kb_8 }, { 5, kb_9 },
+            { 3, kb_GraphVar }, { 6, kb_Add }, { 6, kb_Sub }, { 6, kb_Mul }, { 6, kb_Div }, { 6, kb_Power }, { 5, kb_Chs }, { 6, kb_Enter },
+            { 6, kb_Clear }, { 1, kb_Yequ }, { 1, kb_Graph }, { 2, kb_Square }, { 7, kb_Left }, { 7, kb_Right }, { 7, kb_Up }, { 7, kb_Down },
+            { 1, kb_2nd }, { 1, kb_2nd }, { 4, kb_LParen }, { 5, kb_RParen }, { 6, kb_Enter }, { 2, kb_Math }, { 3, kb_Apps }, { 4, kb_Prgm },
+            { 2, kb_Log }, { 5, kb_Vars }, { 3, kb_Comma }, { 1, kb_Mode }, { 2, kb_Alpha }, { 4, kb_Stat }, { 2, kb_Ln }, { 1, kb_Zoom },
+            { 2, kb_Square }, { 1, kb_2nd }
+        };
         static const char *const probs[] = { "3x+5=20", "x^2-5x+6=0", "2x^2+3x-1=0", "3(x+2)+4x", "x^3+2x", "1/2+3/4", "(1/2)/(3/4)",
-                                            "2x+1=2x+3", "x^2+4=0", "5-(x+2)", "9999x^2+9999x+9999=0", "1/0", "x^4=16", "((((" };
+                                            "2x+1=2x+3", "x^2+4=0", "5-(x+2)", "9999x^2+9999x+9999=0", "1/0", "x^4=16", "((((",
+                                            "(-3+sqrt(17))/4", "sqrt(48)+2", "x^2+sqrt(25)x+6=0", "(-5+sqrt(5^2-4*1*6))/(2*1)", "sqrt(sqrt(", "sqrt(-4)" };
+        static const char *const vennx[] = { "AuB", "n(AuB)'", "A'nB", "n((AnB)uC)", "(AuB)'nC", "AnBnC", "A'uB'uC'", "n(BnC)'", "AuuB", "D", "((A" };
         if (--fuzz_left <= 0) { fuzz_left = 1; }
-        if (fuzz_frames-- <= 0) { memset(kb, 0, 8); if ((fuzz_frames & 3) == 0) kb[6] |= kb_Clear; return; }   /* time is up: CLEAR our way out */
+        if (fuzz_frames-- <= 0) {                     /* time is up: DEL ends it, from wherever the game is */
+            memset(kb, 0, 8);
+            kb[1] |= kb_Del;
+            del_intended = 1;
+            return;
+        }
+        if (rr() % 400 == 0) { kb[1] |= kb_Del; del_intended = 1; return; }
+        if (cur_present_screen == SC_VENN && rr() % 12 == 0) {
+            char nums[80];
+            int k, n = (int)(rr() % 10);
+            nums[0] = 0;
+            for (k = 0; k < n; k++) { char one[8]; sprintf(one, k ? ",%d" : "%d", (int)(rr() % 70)); strcat(nums, one); }
+            venn_type(nums, vennx[rr() % (sizeof vennx / sizeof vennx[0])]);
+            tap(1, kb_Graph);
+            { int e = (int)(rr() % 12); while (e-- > 0) tap(6, kb_Enter); }
+            return;
+        }
         if (rr() % (getenv("FUZZ_TYPE") ? (unsigned)atoi(getenv("FUZZ_TYPE")) : 60u) == 0) {
-            typestr(probs[rr() % (sizeof probs / sizeof probs[0])]);
+            typeall(probs[rr() % (sizeof probs / sizeof probs[0])]);
             tap(6, kb_Enter);
             { int n = (int)(rr() % 30); while (n-- > 0) tap(6, kb_Enter); }
             return;
@@ -1131,9 +2080,9 @@ void stub_feed_keys(uint8_t *kb)
         {
             int n = (int)(rr() % 3), k;
             for (k = 0; k < n; k++) {
-                int i = (int)(rr() % (sizeof g));
-                if (g[i] == 6 && m[i] == kb_Clear && rr() % 4) continue;
-                kb[g[i]] |= m[i];
+                int i = (int)(rr() % (sizeof K / sizeof K[0]));
+                if (K[i].g == 6 && K[i].m == kb_Clear && rr() % 4) continue;
+                kb[K[i].g] |= K[i].m;
             }
         }
     }
@@ -1164,6 +2113,9 @@ static void shots_script(void)
         { "3x^2+5x+7", "derivative2", 1 },
         { "1/4+1/6", "fractions_add", 0 },
         { "(1/2)/(3/4)", "fractions_div", 0 },
+        { "(-3+sqrt(17))/4", "sqrt_formula", 0 },
+        { "(-5+sqrt(5^2-4*1*6))/(2*1)", "sqrt_formula2", 0 },
+        { "x^2+sqrt(25)x+6=0", "sqrt_in_equation", 0 },
         { "x/2=1", "cannot", 0 },
         { "3x+", "cannot_syntax", 0 }
     };
@@ -1171,17 +2123,23 @@ static void shots_script(void)
     int s, needclear = 0;
     idle(4);
     shot("00_title");
-    tap(7, kb_Down); tap(7, kb_Down); tap(6, kb_Enter); idle(4); shot("01_help_types");
+    pick_title(4); idle(2); shot("01_help_types");
     tap(7, kb_Right); idle(2); shot("02_help_typing");
-    tap(7, kb_Right); idle(2); shot("03_help_limits");
+    tap(7, kb_Right); idle(2); shot("03_help_venn");
+    tap(7, kb_Right); idle(2); shot("03b_help_limits");
+    tap(7, kb_Right); idle(2); shot("03c_help_del");
     tap(6, kb_Clear); idle(4);
-    tap(7, kb_Up); tap(7, kb_Up); tap(6, kb_Enter); idle(4);
+    pick_title(0); idle(2);
     shot("04_input_empty");
+    /* the 2nd key: lit, then sqrt( typed by the next key, then off again */
+    tap(1, kb_2nd); idle(2); shot("05_input_2nd_lit");
+    tap(2, kb_Square); idle(2); shot("05b_input_sqrt_typed_2nd_off");
+    tap(1, kb_Mode); idle(2);
     for (i = 0; i < sizeof P / sizeof P[0]; i++) {
         cls_t cl;
         int type, solved = 0, n = 0;
-        if (needclear) { tap(6, kb_Clear); idle(2); }
-        typestr(P[i].prob);
+        if (needclear) { tap(1, kb_Mode); idle(2); }
+        typeall(P[i].prob);
         idle(2);
         shot(shot_name("%s_a_input%.0d", P[i].name, 0));
         if (classify(P[i].prob, &cl)) {
@@ -1211,13 +2169,62 @@ static void shots_script(void)
         needclear = 0;
     }
     /* history */
-    if (needclear) { tap(6, kb_Clear); idle(2); }
+    if (needclear) { tap(1, kb_Mode); idle(2); }
     tap(6, kb_Clear); idle(3);
-    tap(7, kb_Down); tap(6, kb_Enter); idle(4);
+    pick_title(3); idle(2);
     shot("history");
     tap(6, kb_Enter); idle(3);
     shot("history_replay_s1");
     tap(6, kb_Clear); idle(2); tap(6, kb_Clear); idle(2);
+    /* Venn diagrams */
+    {
+        static const struct { int k; const char *nums; const char *expr; const char *name; } V[] = {
+            { 2, "20,12,9,5,", "n(AuB)", "venn2" },
+            { 2, "20,12,9,5,", "(AuB)'", "venn2_complement" },
+            { 3, "50,20,18,15,8,7,6,3,", "n(AuB)'nC", "venn3_nested" },
+            { 3, "50,20,18,15,8,7,6,3,", "n((AnB)uC)", "venn3_nested2" },
+            { 3, "50,20,18,15,8,7,6,3,", "AuBuC", "venn3_union" },
+            { 3, "50,20,18,15,8,7,6,3,", "", "venn3_plain" }
+        };
+        size_t v;
+        for (v = 0; v < sizeof V / sizeof V[0]; v++) {
+            int n = venn_count(V[v].k, V[v].nums, V[v].expr), st;
+            pick_title(V[v].k - 1);
+            idle(2);
+            venn_type(V[v].nums, V[v].expr);
+            idle(2);
+            shot(shot_name("%s_a_form%.0d", V[v].name, 0));
+            tap(1, kb_Graph);
+            idle(3);
+            for (st = 0; st < n; st++) {
+                shot(shot_name("%s_s%02d", V[v].name, st + 1));
+                tap(6, kb_Enter);
+                idle(2);
+            }
+            shot(shot_name("%s_z_end_menu%.0d", V[v].name, 0));
+            tap(7, kb_Down); tap(7, kb_Down); tap(6, kb_Enter); idle(3);      /* back to the main menu */
+        }
+        /* numbers that do not fit together, and an expression with a mistake */
+        pick_title(1); idle(2);
+        venn_type("20,12,9,10,", "");
+        idle(2);
+        shot("venn_bad_a_form");
+        tap(1, kb_Graph); idle(3);
+        shot("venn_bad_b_message");
+        tap(6, kb_Enter); idle(3);
+        tap(1, kb_Mode); idle(2);
+        pick_title(2); idle(2);
+        venn_type("50,20,18,15,8,7,6,3,", "(AuB");
+        tap(1, kb_Graph); idle(3);
+        shot("venn_badexpr_message");
+        tap(6, kb_Enter); idle(3);
+        tap(1, kb_Mode); idle(2);
+        pick_title(1); idle(2);
+        venn_type("20,12,9,5", "");
+        idle(2);
+        shot("venn_form_2sets");
+        tap(1, kb_Mode); idle(2);
+    }
 }
 
 /* ---------------------------------------------------------------- */
@@ -1246,6 +2253,7 @@ int main(int argc, char **argv)
     if (!strcmp(sc, "garbage")) {
         logf_ = 0;
         run_garbage(n);
+        run_venn_garbage(n);
         printf("garbage: %ld checks, %ld failures, longest text %d lines, state %d lines, truncated %ld\n", checks, fails, max_text_lines, max_state_lines, trunc_n);
         return fails != 0 || trunc_n != 0;
     }
@@ -1253,12 +2261,43 @@ int main(int argc, char **argv)
         fuzz_mode = 1;
         fuzz_frames = n;
         logf_ = 0;
-        stub_ghost_on = 0;
+        stub_ghost_on = 1;                          /* keypad ghosting simulated on every scan */
         while (fuzz_frames > 0) game_main();
-        printf("fuzz: %ld frames shown, presents by screen:", frames);
-        { int i; for (i = 0; i < 8; i++) printf(" %ld", present_count[i]); }
-        printf("\ntruncated strings: %ld  text overflow: %ld  NoClip violations: %ld\n", trunc_n, text_overflow, violations);
-        return trunc_n != 0 || text_overflow != 0 || violations != 0;
+        printf("fuzz: %ld frames shown, presents by screen (title input steps end history help error choose venn):", frames);
+        { int i; for (i = 0; i < 9; i++) printf(" %ld", present_count[i]); }
+        printf("\ntruncated strings: %ld  text overflow: %ld  NoClip violations: %ld  failures: %ld\n", trunc_n, text_overflow, violations, fails);
+        printf("DEL quits: %ld (every one pressed on purpose; the last one ended the run), gfx_End() reached: %d\n", del_quits_total, stub_gfx_ended);
+        return fails != 0 || trunc_n != 0 || text_overflow != 0 || violations != 0 || !stub_gfx_ended;
+    }
+    if (!strcmp(sc, "venn")) {
+        if (getenv("LOG")) logf_ = fopen(getenv("LOG"), "w"); else logf_ = 0;
+        run_venn_tests(n);
+        printf("venn: %ld checks, %ld failures, truncated strings %ld\n", checks, fails, trunc_n);
+        return fails != 0 || trunc_n != 0;
+    }
+    if (!strcmp(sc, "radical")) {
+        if (getenv("LOG")) logf_ = fopen(getenv("LOG"), "w"); else logf_ = 0;
+        run_radical_tests(n);
+        run_sqrt_equations();
+        printf("radical: %ld checks, %ld failures, truncated strings %ld\n", checks, fails, trunc_n);
+        return fails != 0 || trunc_n != 0;
+    }
+    if (!strcmp(sc, "ui")) {
+        logf_ = 0;
+        stub_ghost_on = 0;
+        run_second_key_test();
+        run_sqrt_ui_test();
+        run_venn_ui_test();
+        printf("ui: %ld checks, %ld failures, text overflow %ld, NoClip violations %ld\n", checks, fails, text_overflow, violations);
+        return fails != 0 || text_overflow != 0 || violations != 0;
+    }
+    if (!strcmp(sc, "del")) {
+        logf_ = 0;
+        stub_ghost_on = 0;
+        run_phantom_test();
+        run_del_tests();
+        printf("del: %ld checks, %ld failures\n", checks, fails);
+        return fails != 0;
     }
     if (!strcmp(sc, "shots")) {
         shot_dir = argc > 2 ? argv[2] : ".";
